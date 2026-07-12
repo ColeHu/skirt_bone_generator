@@ -1,729 +1,3389 @@
+# SPDX-License-Identifier: MIT
+# -*- coding: utf-8 -*-
+
 bl_info = {
-    "name": "skirt_bone_generator",
+    "name": "裙子骨骼生成器",
     "author": "Akazure",
     "version": (1, 0, 0),
-    "blender": (3, 6, 0),
-    "location": "3D Viewport > 侧栏 > 裙子骨骼",
-    "description": "根据选择的水平边环自动生成裙子骨骼链",
+    "blender": (4, 5, 0),
+    "location": "3D 视图 > 右侧边栏 > 自动裙骨",
+    "description": "根据控制点生成裙子骨骼",
     "category": "Rigging",
 }
 
-import bpy
-import bmesh
+import json
 import math
-import string
-from mathutils import Vector
+
+import bmesh
+import bpy
+import gpu
+from bpy.app.handlers import persistent
+from gpu_extras.batch import batch_for_shader
 from bpy.props import (
-    StringProperty, IntProperty, PointerProperty,
+    BoolProperty,
+    EnumProperty,
+    FloatProperty,
+    IntProperty,
+    PointerProperty,
+    StringProperty,
 )
+from mathutils import Vector
 
 
-# ===================== 工具函数 =====================
+CONTROL_DIRECTIONS = ("Front", "Right", "Back", "Left")
+CONTROL_LEVELS = 4
+EPSILON = 1.0e-8
+MIN_WEIGHT = 0.001
+PARENT_WEIGHT_KEY = "__AUTO_SKIRT_PARENT__"
 
-def _get_selected_edge_loops(bm):
+PROP_COLLECTION = "auto_skirt_control_collection"
+PROP_ARMATURE = "auto_skirt_target_armature"
+PROP_PARENT = "auto_skirt_parent_bone"
+PROP_PREFIX = "auto_skirt_prefix"
+PROP_ROWS = "auto_skirt_rows"
+PROP_COLUMNS = "auto_skirt_columns"
+PROP_BONE_COLLECTION = "auto_skirt_bone_collection"
+PROP_INDICES = "auto_skirt_selected_indices"
+PROP_RECORDS = "auto_skirt_selection_records"
+PROP_TARGET = "auto_skirt_target_mesh"
+PROP_TARGETS = "auto_skirt_target_meshes"
+PROP_KIND = "auto_skirt_generated_kind"
+
+PROP_PROXY_KIND = "PROXY"
+EDIT_KIND_CONTROL = "CONTROL"
+EDIT_SNAPSHOT_EPSILON = 1.0e-7
+_MIRROR_GUARD = False
+_LR_SUFFIX_NAMING_ENABLED = False
+_LR_SUFFIX_COLUMN_MAP = {}
+_SELECTION_MARKER_DRAW_HANDLE = None
+
+
+# ---------------------------------------------------------------------------
+# General utilities
+# ---------------------------------------------------------------------------
+
+
+def clamp(value, minimum, maximum):
+    return max(minimum, min(maximum, value))
+
+
+def smoothstep(x):
+    """Clamped cubic smoothstep."""
+    x = clamp(float(x), 0.0, 1.0)
+    return x * x * (3.0 - 2.0 * x)
+
+
+def _safe_normalized(vector, fallback):
+    vector = Vector(vector)
+    if vector.length_squared <= EPSILON:
+        vector = Vector(fallback)
+    if vector.length_squared <= EPSILON:
+        return Vector((0.0, 0.0, 1.0))
+    return vector.normalized()
+
+
+def _prefix_stem(prefix):
+    return prefix.rstrip("_") or "AutoSkirt"
+
+
+def _control_collection_name(prefix, mesh_name):
+    return f"{_prefix_stem(prefix)}Controls_{mesh_name}"
+
+
+def _debug_collection_name(prefix, mesh_name):
+    return f"{_prefix_stem(prefix)}Debug_{mesh_name}"
+
+
+def _proxy_collection_name(prefix, mesh_name):
+    return f"{_prefix_stem(prefix)}Proxy_{mesh_name}"
+
+
+def _control_name(prefix, direction, level):
+    return f"{prefix}CTRL_{direction}_L{level}"
+
+
+def _column_average(samples, column):
+    points = [Vector(row[column]) for row in samples if column < len(row)]
+    return _average_points(points) if points else Vector((0.0, 0.0, 0.0))
+
+
+def _lr_suffix_sort_key(centers, column):
+    point = centers[column]
+    return (math.atan2(point.y, point.x), abs(point.x), column)
+
+
+def _configure_lr_suffix_naming(samples, enabled):
+    """Configure temporary symmetric .L/.R bone naming from world-space samples.
+
+    The center is the world origin: negative X columns become .L, positive X
+    columns become .R.  Mirrored pairs share one column number so Blender-style
+    left/right naming remains symmetric.
     """
-    从 bmesh 中获取已选择的边，按连通环分组。
-    返回 list[list[BMVert]]，每个子列表是一个环上的顶点（有序）。
+    global _LR_SUFFIX_NAMING_ENABLED, _LR_SUFFIX_COLUMN_MAP
+    _LR_SUFFIX_NAMING_ENABLED = bool(enabled)
+    _LR_SUFFIX_COLUMN_MAP = {}
+    if not enabled or not samples or not samples[0]:
+        return
+
+    columns = len(samples[0])
+    centers = {column: _column_average(samples, column) for column in range(columns)}
+    max_abs_x = max((abs(point.x) for point in centers.values()), default=0.0)
+    side_epsilon = max(max_abs_x * 1.0e-5, 1.0e-6)
+
+    left_columns = [
+        column for column, point in centers.items()
+        if point.x < -side_epsilon
+    ]
+    right_columns = [
+        column for column, point in centers.items()
+        if point.x > side_epsilon
+    ]
+    center_columns = [
+        column for column, point in centers.items()
+        if abs(point.x) <= side_epsilon
+    ]
+
+    unused_right = set(right_columns)
+    pair_index = 0
+    for left_column in sorted(left_columns, key=lambda col: _lr_suffix_sort_key(centers, col)):
+        left_center = centers[left_column]
+        mirrored = Vector((-left_center.x, left_center.y, left_center.z))
+        right_column = None
+        if unused_right:
+            right_column = min(
+                unused_right,
+                key=lambda col: (centers[col] - mirrored).length_squared,
+            )
+            unused_right.remove(right_column)
+        _LR_SUFFIX_COLUMN_MAP[left_column] = (pair_index, ".L")
+        if right_column is not None:
+            _LR_SUFFIX_COLUMN_MAP[right_column] = (pair_index, ".R")
+        pair_index += 1
+
+    for right_column in sorted(unused_right, key=lambda col: _lr_suffix_sort_key(centers, col)):
+        _LR_SUFFIX_COLUMN_MAP[right_column] = (pair_index, ".R")
+        pair_index += 1
+
+    # Centerline columns are left unsuffixed and keep their original column
+    # index, avoiding false .L/.R labels for exact X=0 samples.
+    for center_column in center_columns:
+        _LR_SUFFIX_COLUMN_MAP[center_column] = (center_column, "")
+
+
+def _bone_name(prefix, column, row):
+    if _LR_SUFFIX_NAMING_ENABLED:
+        mapped = _LR_SUFFIX_COLUMN_MAP.get(column)
+        if mapped is not None:
+            mapped_column, suffix = mapped
+            return f"{prefix}C{mapped_column:02d}_R{row:02d}{suffix}"
+    return f"{prefix}C{column:02d}_R{row:02d}"
+
+
+def _temporary_bone_name(prefix, column, row):
+    """Physical build name used before optional .L/.R suffix assignment."""
+    return f"{prefix}__BUILD_C{column:03d}_R{row:03d}"
+
+
+
+def _poll_mesh(_self, obj):
+    return obj is not None and obj.type == 'MESH'
+
+
+def _poll_armature(_self, obj):
+    return obj is not None and obj.type == 'ARMATURE'
+
+
+def _resolve_target_mesh(context, settings):
+    obj = settings.target_mesh
+    if obj is None:
+        active = context.active_object
+        if active is not None and active.type == 'MESH':
+            obj = active
+    return obj
+
+
+def _stored_target_meshes(primary_mesh):
+    """Load the mesh set that shares one generated control cage."""
+    if primary_mesh is None or primary_mesh.type != 'MESH':
+        return []
+    try:
+        names = json.loads(primary_mesh.get(PROP_TARGETS, "[]"))
+    except (TypeError, json.JSONDecodeError):
+        names = []
+    result = []
+    for name in names:
+        obj = bpy.data.objects.get(str(name))
+        if obj is not None and obj.type == 'MESH' and obj not in result:
+            result.append(obj)
+    if primary_mesh not in result:
+        result.insert(0, primary_mesh)
+    return result
+
+
+def _resolve_target_meshes(context, settings, prefer_edit_selection=False):
+    """Resolve a shared cage target set, preferring multi-object Edit Mode."""
+    selected_meshes = [
+        obj for obj in context.selected_objects
+        if obj.type == 'MESH' and obj.name in context.view_layer.objects
+    ]
+    edit_meshes = [obj for obj in selected_meshes if obj.mode == 'EDIT']
+    primary = _resolve_target_mesh(context, settings)
+
+    if edit_meshes:
+        active = context.active_object
+        if active is not None and active.type == 'MESH' and active in edit_meshes:
+            primary = active
+        elif primary not in edit_meshes:
+            primary = edit_meshes[0]
+        ordered = [primary] + [obj for obj in edit_meshes if obj != primary]
+        return ordered
+
+    if primary is not None and primary.type == 'MESH':
+        stored = _stored_target_meshes(primary)
+        if len(stored) > 1 or prefer_edit_selection:
+            return stored
+
+    if selected_meshes:
+        if primary in selected_meshes:
+            return [primary] + [obj for obj in selected_meshes if obj != primary]
+        return selected_meshes
+    return [primary] if primary is not None and primary.type == 'MESH' else []
+
+
+def _validate_prefix(prefix):
+    if not prefix or not prefix.strip("_ "):
+        raise ValueError("Prefix 不能为空，也不能只包含下划线")
+
+
+def _average_points(points):
+    if not points:
+        return Vector((0.0, 0.0, 0.0))
+    total = Vector((0.0, 0.0, 0.0))
+    for point in points:
+        total += point
+    return total / len(points)
+
+
+def _scene_has_object(context, obj):
+    return obj is not None and obj.name in context.view_layer.objects
+
+
+class _ContextState:
+    """Save and restore the user's active object, selection, and object mode."""
+
+    def __init__(self, context):
+        self.active_name = context.active_object.name if context.active_object else ""
+        self.selected_names = [obj.name for obj in context.selected_objects]
+        active = context.active_object
+        self.mode = active.mode if active is not None else 'OBJECT'
+
+    def restore(self, context):
+        try:
+            active = context.view_layer.objects.active
+            if active is not None and active.mode != 'OBJECT':
+                bpy.ops.object.mode_set(mode='OBJECT')
+        except RuntimeError:
+            pass
+
+        for obj in context.view_layer.objects:
+            try:
+                obj.select_set(False)
+            except RuntimeError:
+                pass
+
+        for name in self.selected_names:
+            obj = bpy.data.objects.get(name)
+            if obj is not None and obj.name in context.view_layer.objects:
+                try:
+                    obj.select_set(True)
+                except RuntimeError:
+                    pass
+
+        active = bpy.data.objects.get(self.active_name)
+        if active is None or active.name not in context.view_layer.objects:
+            return
+        context.view_layer.objects.active = active
+        try:
+            active.select_set(True)
+        except RuntimeError:
+            pass
+
+        if self.mode != 'OBJECT':
+            try:
+                bpy.ops.object.mode_set(mode=self.mode)
+            except RuntimeError:
+                # Restoring selection is more important than failing the operator.
+                pass
+
+
+def _activate_object(context, obj, mode='OBJECT'):
+    active = context.view_layer.objects.active
+    if active is not None and active.mode != 'OBJECT':
+        bpy.ops.object.mode_set(mode='OBJECT')
+    for selected in context.selected_objects:
+        selected.select_set(False)
+    obj.hide_set(False)
+    obj.select_set(True)
+    context.view_layer.objects.active = obj
+    if mode != 'OBJECT':
+        bpy.ops.object.mode_set(mode=mode)
+
+
+# ---------------------------------------------------------------------------
+# Selection collection and persistence
+# ---------------------------------------------------------------------------
+
+
+def get_selected_vertices(mesh_obj):
     """
-    sel_edges = [e for e in bm.edges if e.select]
-    if not sel_edges:
+    Return records containing vertex index, local position, and world position.
+
+    Selection is intentionally read only from Mesh Edit Mode. An empty result is
+    never interpreted as "use the whole object".
+    """
+    if mesh_obj is None or mesh_obj.type != 'MESH' or mesh_obj.mode != 'EDIT':
         return []
 
-    adj = {}
-    for e in sel_edges:
-        for v in e.verts:
-            if v not in adj:
-                adj[v] = []
-        adj[e.verts[0]].append(e.verts[1])
-        adj[e.verts[1]].append(e.verts[0])
-
-    visited = set()
-    loops = []
-    for start_v in adj:
-        if start_v in visited:
-            continue
-        ring = []
-        queue = [start_v]
-        while queue:
-            v = queue.pop(0)
-            if v in visited:
-                continue
-            visited.add(v)
-            ring.append(v)
-            for nb in adj.get(v, []):
-                if nb not in visited:
-                    queue.append(nb)
-        if ring:
-            loops.append(ring)
-
-    return loops
+    bm = bmesh.from_edit_mesh(mesh_obj.data)
+    bm.verts.index_update()
+    bm.verts.ensure_lookup_table()
+    bm.normal_update()
+    matrix_world = mesh_obj.matrix_world
+    normal_matrix = matrix_world.to_3x3().inverted_safe().transposed()
+    records = []
+    for vert in bm.verts:
+        if vert.select and not vert.hide:
+            local = vert.co.copy()
+            world = matrix_world @ local
+            normal = _safe_normalized(
+                normal_matrix @ vert.normal,
+                Vector((0.0, 0.0, 1.0)),
+            )
+            records.append({
+                "index": int(vert.index),
+                "local": local,
+                "world": world,
+                "normal": normal,
+            })
+    records.sort(key=lambda item: item["index"])
+    return records
 
 
-def _sort_loop_verts(loop_verts):
-    """对一个环上的顶点按角度排序（绕环中心），返回有序列表。"""
-    if len(loop_verts) <= 2:
-        return loop_verts
-
-    center = Vector((0, 0, 0))
-    for v in loop_verts:
-        center += v.co
-    center /= len(loop_verts)
-
-    ref = (loop_verts[0].co - center).normalized()
-    v0 = loop_verts[0].co - center
-    v1 = loop_verts[1].co - center if len(loop_verts) > 1 else Vector((0, 0, 1))
-    normal = v0.cross(v1).normalized()
-    if normal.length < 1e-6:
-        normal = Vector((0, 0, 1))
-
-    def angle_key(v):
-        d = v.co - center
-        x = d.dot(ref)
-        y = d.dot(normal.cross(ref))
-        return math.atan2(y, x)
-
-    return sorted(loop_verts, key=angle_key)
+def _store_selection_records(mesh_obj, records):
+    compact_records = []
+    indices = []
+    for item in records:
+        local = item["local"]
+        world = item["world"]
+        index = int(item["index"])
+        indices.append(index)
+        normal = item.get("normal", Vector((0.0, 0.0, 1.0)))
+        compact_records.append([
+            index,
+            float(local.x), float(local.y), float(local.z),
+            float(world.x), float(world.y), float(world.z),
+            float(normal.x), float(normal.y), float(normal.z),
+        ])
+    mesh_obj[PROP_INDICES] = json.dumps(indices, separators=(",", ":"))
+    mesh_obj[PROP_RECORDS] = json.dumps(compact_records, separators=(",", ":"))
 
 
-def _sort_loops_top_to_bottom(loops):
-    """按平均 Z 坐标从高到低排序环"""
-    def avg_z(loop):
-        return sum(v.co.z for v in loop) / len(loop)
-    return sorted(loops, key=avg_z, reverse=True)
+def _load_selected_indices(mesh_obj):
+    raw = mesh_obj.get(PROP_INDICES, "")
+    if not raw:
+        return []
+    try:
+        values = json.loads(raw)
+    except (TypeError, json.JSONDecodeError):
+        return []
+    vertex_count = len(mesh_obj.data.vertices)
+    return sorted({
+        int(value) for value in values
+        if isinstance(value, (int, float)) and 0 <= int(value) < vertex_count
+    })
 
 
-def _fit_ellipse_coords(loop_verts, shared_frame=None):
-    """
-    为环上的顶点拟合一个最佳椭圆，然后将每个顶点投影到椭圆上
-    对应角度的位置。返回 (投影坐标列表, 帧信息字典)。
+def _current_or_stored_indices(mesh_obj):
+    current = get_selected_vertices(mesh_obj)
+    if current:
+        _store_selection_records(mesh_obj, current)
+        return [item["index"] for item in current]
+    return _load_selected_indices(mesh_obj)
 
-    如果提供 shared_frame，则使用共享的坐标系和PCA轴方向，
-    确保多个环的椭圆对齐。每个环仍然独立计算中心和半轴长度。
-    """
-    if len(loop_verts) <= 2:
-        return [v.co.copy() for v in loop_verts], None
 
-    center = Vector((0, 0, 0))
-    for v in loop_verts:
-        center += v.co
-    center /= len(loop_verts)
+def _store_mesh_metadata(mesh_obj, settings, collection_name, target_meshes=None):
+    mesh_obj[PROP_COLLECTION] = collection_name
+    mesh_obj[PROP_ARMATURE] = (
+        settings.target_armature.name if settings.target_armature else ""
+    )
+    mesh_obj[PROP_PARENT] = settings.parent_bone
+    mesh_obj[PROP_PREFIX] = settings.prefix
+    mesh_obj[PROP_ROWS] = settings.rows
+    mesh_obj[PROP_COLUMNS] = settings.columns
+    mesh_obj[PROP_BONE_COLLECTION] = settings.bone_collection
+    if target_meshes is not None:
+        mesh_obj[PROP_TARGETS] = json.dumps(
+            [obj.name for obj in target_meshes if obj is not None and obj.type == 'MESH'],
+            separators=(",", ":"),
+        )
 
-    # 坐标系：使用共享帧或自行计算
-    if shared_frame:
-        ref = shared_frame['ref']
-        tangent = shared_frame['tangent']
-        normal = shared_frame['normal']
-    else:
-        ref = (loop_verts[0].co - center).normalized()
-        v0 = loop_verts[0].co - center
-        v1 = loop_verts[1].co - center if len(loop_verts) > 1 else Vector((0, 0, 1))
-        normal = v0.cross(v1).normalized()
-        if normal.length < 1e-6:
-            normal = Vector((0, 0, 1))
-        tangent = normal.cross(ref).normalized()
 
-    # 投影到2D
-    pts_2d = []
-    heights = []
-    for v in loop_verts:
-        d = v.co - center
-        x = d.dot(ref)
-        y = d.dot(tangent)
-        h = d.dot(normal)
-        pts_2d.append((x, y))
-        heights.append(h)
+# ---------------------------------------------------------------------------
+# Collections and generated object cleanup
+# ---------------------------------------------------------------------------
 
-    n = len(pts_2d)
-    mean_x = sum(p[0] for p in pts_2d) / n
-    mean_y = sum(p[1] for p in pts_2d) / n
 
-    # PCA轴：使用共享帧或自行计算
-    if shared_frame and 'ex1' in shared_frame:
-        ex1 = shared_frame['ex1']
-        ex2 = shared_frame['ex2']
-    else:
-        # 协方差矩阵
-        cxx = sum((p[0] - mean_x) ** 2 for p in pts_2d) / n
-        cxy = sum((p[0] - mean_x) * (p[1] - mean_y) for p in pts_2d) / n
-        cyy = sum((p[1] - mean_y) ** 2 for p in pts_2d) / n
+def get_or_create_collection(name):
+    collection = bpy.data.collections.get(name)
+    if collection is None:
+        collection = bpy.data.collections.new(name)
+    scene_children = bpy.context.scene.collection.children
+    if collection.name not in scene_children:
+        scene_children.link(collection)
+    return collection
 
-        # 特征值分解 2x2
-        trace = cxx + cyy
-        det = cxx * cyy - cxy * cxy
-        disc = math.sqrt(max(trace * trace / 4 - det, 0))
-        lambda1 = trace / 2 + disc
 
-        # 主方向
-        if abs(cxy) > 1e-10:
-            ex1 = (lambda1 - cyy, cxy)
-            mag1 = math.sqrt(ex1[0] ** 2 + ex1[1] ** 2)
-            ex1 = (ex1[0] / mag1, ex1[1] / mag1)
-        elif cxx >= cyy:
-            ex1 = (1.0, 0.0)
-        else:
-            ex1 = (0.0, 1.0)
-        ex2 = (-ex1[1], ex1[0])
+def delete_generated_controls(prefix, mesh_name):
+    """Delete only marked control objects whose names match the requested prefix."""
+    object_prefix = f"{prefix}CTRL_"
+    removed = 0
+    for obj in list(bpy.data.objects):
+        if (
+            obj.name.startswith(object_prefix)
+            and obj.get(PROP_TARGET) == mesh_name
+            and obj.get(PROP_KIND) == EDIT_KIND_CONTROL
+        ):
+            bpy.data.objects.remove(obj, do_unlink=True)
+            removed += 1
 
-    # 每个环独立计算半轴长度
-    max_a = 0
-    max_b = 0
-    for p in pts_2d:
-        dx, dy = p[0] - mean_x, p[1] - mean_y
-        proj_a = abs(dx * ex1[0] + dy * ex1[1])
-        proj_b = abs(dx * ex2[0] + dy * ex2[1])
-        if proj_a > max_a:
-            max_a = proj_a
-        if proj_b > max_b:
-            max_b = proj_b
+    for collection in list(bpy.data.collections):
+        if (
+            collection.name == _control_collection_name(prefix, mesh_name)
+            and len(collection.objects) == 0
+            and len(collection.children) == 0
+        ):
+            bpy.data.collections.remove(collection)
+    return removed
 
-    if max_a < 1e-6:
-        max_a = 1e-6
-    if max_b < 1e-6:
-        max_b = 1e-6
 
-    # 将每个顶点按其角度投影到椭圆上
-    projected = []
-    for i, (px, py) in enumerate(pts_2d):
-        dx, dy = px - mean_x, py - mean_y
-        u = dx * ex1[0] + dy * ex1[1]
-        v = dx * ex2[0] + dy * ex2[1]
-        angle = math.atan2(v, u)
+def _delete_debug_objects(prefix, mesh_name):
+    object_prefix = f"{prefix}DEBUG_"
+    removed = 0
+    for obj in list(bpy.data.objects):
+        if (
+            obj.name.startswith(object_prefix)
+            and obj.get(PROP_TARGET) == mesh_name
+            and obj.get(PROP_KIND) == "DEBUG"
+        ):
+            data = obj.data
+            bpy.data.objects.remove(obj, do_unlink=True)
+            if data is not None and data.users == 0:
+                bpy.data.curves.remove(data)
+            removed += 1
 
-        eu = max_a * math.cos(angle)
-        ev = max_b * math.sin(angle)
+    for collection in list(bpy.data.collections):
+        if (
+            collection.name == _debug_collection_name(prefix, mesh_name)
+            and len(collection.objects) == 0
+            and len(collection.children) == 0
+        ):
+            bpy.data.collections.remove(collection)
+    return removed
 
-        nx = mean_x + eu * ex1[0] + ev * ex2[0]
-        ny = mean_y + eu * ex1[1] + ev * ex2[1]
 
-        new_co = center + ref * nx + tangent * ny + normal * heights[i]
-        projected.append(new_co)
+def _delete_proxy_objects(prefix, mesh_name):
+    object_prefix = f"{prefix}PROXY_"
+    removed = 0
+    for obj in list(bpy.data.objects):
+        if (
+            obj.name.startswith(object_prefix)
+            and obj.get(PROP_TARGET) == mesh_name
+            and obj.get(PROP_KIND) == PROP_PROXY_KIND
+        ):
+            data = obj.data
+            bpy.data.objects.remove(obj, do_unlink=True)
+            if data is not None and data.users == 0:
+                bpy.data.meshes.remove(data)
+            removed += 1
 
-    frame = {
-        'ref': ref, 'tangent': tangent, 'normal': normal,
-        'ex1': ex1, 'ex2': ex2,
-        'max_a': max_a, 'max_b': max_b, 'center': center.copy(),
+    for collection in list(bpy.data.collections):
+        if (
+            collection.name == _proxy_collection_name(prefix, mesh_name)
+            and len(collection.objects) == 0
+            and len(collection.children) == 0
+        ):
+            bpy.data.collections.remove(collection)
+    return removed
+
+
+# ---------------------------------------------------------------------------
+# Control point edit session
+# ---------------------------------------------------------------------------
+
+
+def _flatten_control_objects(control_objects):
+    return [
+        control_objects[direction][level]
+        for direction in CONTROL_DIRECTIONS
+        for level in range(CONTROL_LEVELS)
+        if control_objects[direction][level] is not None
+    ]
+
+
+def _control_position_map(control_objects):
+    return {
+        obj.name: [float(obj.location.x), float(obj.location.y), float(obj.location.z)]
+        for obj in _flatten_control_objects(control_objects)
     }
-    return projected, frame
 
 
-def _ellipse_equal_arc_angles(a, b, t_start, t_end, n_points, steps=512):
-    """
-    在椭圆上从参数角 t_start 到 t_end 返回 n_points 个等弧长的参数角度。
-    a, b 是椭圆半轴长度。包含 t_start 和 t_end。
-    """
-    if n_points <= 1:
-        return [t_start]
-    if n_points == 2:
-        return [t_start, t_end]
-
-    dt = (t_end - t_start) / steps
-    cum_len = [0.0]
-    for i in range(steps):
-        t = t_start + (i + 0.5) * dt
-        ds = math.sqrt((a * math.sin(t)) ** 2 + (b * math.cos(t)) ** 2) * abs(dt)
-        cum_len.append(cum_len[-1] + ds)
-
-    total = cum_len[-1]
-    if total < 1e-12:
-        return [t_start + (t_end - t_start) * k / (n_points - 1)
-                for k in range(n_points)]
-
-    angles = [t_start]
-    for k in range(1, n_points - 1):
-        target = total * k / (n_points - 1)
-        lo, hi = 0, steps
-        while lo < hi:
-            mid = (lo + hi) // 2
-            if cum_len[mid + 1] < target:
-                lo = mid + 1
-            else:
-                hi = mid
-        if lo < steps:
-            seg_len = cum_len[lo + 1] - cum_len[lo]
-            frac = (target - cum_len[lo]) / max(seg_len, 1e-12)
-            angle = t_start + (lo + frac) * dt
-        else:
-            angle = t_end
-        angles.append(angle)
-    angles.append(t_end)
-    return angles
+def _json_position_map(control_objects):
+    return json.dumps(_control_position_map(control_objects), separators=(",", ":"))
 
 
-def _chain_label(chain_idx, total_chains):
-    """
-    生成骨骼链标签：
-    - 链数 <= 26 时用字母 a~z
-    - 链数 > 26 时用三位数字 001~
-    """
-    if total_chains <= 26:
-        return string.ascii_lowercase[chain_idx]
-    else:
-        return f"{chain_idx + 1:03d}"
+def _parse_json_dict(raw):
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw)
+    except (TypeError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
 
 
-def _bone_name(prefix, chain_label, bone_idx, side=""):
-    """生成骨骼名称: prefix.chain_label.bone_idx[.L/.R]"""
-    name = f"{prefix}.{chain_label}.{bone_idx + 1:03d}"
-    if side:
-        name += f".{side}"
-    return name
+def _vector_from_json(value):
+    if not isinstance(value, (list, tuple)) or len(value) < 3:
+        return None
+    try:
+        return Vector((float(value[0]), float(value[1]), float(value[2])))
+    except (TypeError, ValueError):
+        return None
 
 
-def _find_closest_vert_in_loop(loop_verts, target_co):
-    """在环上找到距离 target_co 最近的顶点"""
-    best = None
-    best_dist = float('inf')
-    for v in loop_verts:
-        d = (v.co - target_co).length
-        if d < best_dist:
-            best_dist = d
-            best = v
-    return best
+def _set_control_object_locked(obj, locked):
+    obj.hide_select = bool(locked)
+    obj.lock_location = (bool(locked), bool(locked), bool(locked))
+    obj.lock_rotation = (bool(locked), bool(locked), bool(locked))
+    obj.lock_scale = (bool(locked), bool(locked), bool(locked))
 
 
-# ===================== 标记中轴操作 =====================
-
-class SKIRT_OT_MarkFrontAxis(bpy.types.Operator):
-    """标记当前选中的顶点为前中轴"""
-    bl_idname = "skirt.mark_front_axis"
-    bl_label = "标记前中轴"
-    bl_options = {'REGISTER', 'UNDO'}
-
-    @classmethod
-    def poll(cls, context):
-        obj = context.active_object
-        return obj and obj.type == 'MESH' and obj.mode == 'EDIT'
-
-    def execute(self, context):
-        props = context.scene.skirt_bone_props
-        obj = context.active_object
-        bm = bmesh.from_edit_mesh(obj.data)
-        bm.verts.ensure_lookup_table()
-
-        sel_verts = [v for v in bm.verts if v.select]
-        if len(sel_verts) != 1:
-            self.report({'ERROR'}, "请选择恰好 1 个顶点作为前中轴")
-            return {'CANCELLED'}
-
-        props.front_axis_vert_index = sel_verts[0].index
-        self.report({'INFO'}, f"前中轴已标记: 顶点 {sel_verts[0].index}")
-        return {'FINISHED'}
+def _set_controls_locked(control_objects, locked):
+    for obj in _flatten_control_objects(control_objects):
+        _set_control_object_locked(obj, locked)
+        obj.show_in_front = True
 
 
-class SKIRT_OT_MarkBackAxis(bpy.types.Operator):
-    """标记当前选中的顶点为后中轴"""
-    bl_idname = "skirt.mark_back_axis"
-    bl_label = "标记后中轴"
-    bl_options = {'REGISTER', 'UNDO'}
-
-    @classmethod
-    def poll(cls, context):
-        obj = context.active_object
-        return obj and obj.type == 'MESH' and obj.mode == 'EDIT'
-
-    def execute(self, context):
-        props = context.scene.skirt_bone_props
-        obj = context.active_object
-        bm = bmesh.from_edit_mesh(obj.data)
-        bm.verts.ensure_lookup_table()
-
-        sel_verts = [v for v in bm.verts if v.select]
-        if len(sel_verts) != 1:
-            self.report({'ERROR'}, "请选择恰好 1 个顶点作为后中轴")
-            return {'CANCELLED'}
-
-        props.back_axis_vert_index = sel_verts[0].index
-        self.report({'INFO'}, f"后中轴已标记: 顶点 {sel_verts[0].index}")
-        return {'FINISHED'}
+def _control_edit_collection(context, settings):
+    mesh_obj = _resolve_target_mesh(context, settings)
+    if mesh_obj is None and settings.control_edit_mesh_name:
+        mesh_obj = bpy.data.objects.get(settings.control_edit_mesh_name)
+    if mesh_obj is None or mesh_obj.type != 'MESH':
+        raise ValueError("Target Mesh 不存在")
+    collection_name = str(
+        mesh_obj.get(
+            PROP_COLLECTION,
+            _control_collection_name(settings.prefix, mesh_obj.name),
+        )
+    )
+    collection = bpy.data.collections.get(collection_name)
+    if collection is None:
+        raise ValueError("找不到控制点集合，请先生成控制点")
+    controls = find_control_points(collection, settings.prefix, require_all=True)
+    return mesh_obj, collection, controls
 
 
-# ===================== 主操作 =====================
-
-class SKIRT_OT_GenerateBones(bpy.types.Operator):
-    """根据选择的水平边环和中轴标记生成裙子骨骼"""
-    bl_idname = "skirt.generate_bones"
-    bl_label = "生成裙子骨骼"
-    bl_options = {'REGISTER', 'UNDO'}
-
-    @classmethod
-    def poll(cls, context):
-        obj = context.active_object
-        return obj and obj.type == 'MESH' and obj.mode == 'EDIT'
-
-    def execute(self, context):
-        props = context.scene.skirt_bone_props
-        obj = context.active_object
-
-        # 检查中轴标记
-        if props.front_axis_vert_index < 0 or props.back_axis_vert_index < 0:
-            self.report({'ERROR'}, "请先标记前中轴和后中轴顶点")
-            return {'CANCELLED'}
-
-        bm = bmesh.from_edit_mesh(obj.data)
-        bm.verts.ensure_lookup_table()
-        bm.edges.ensure_lookup_table()
-
-        # 1) 提取选中的边环
-        loops = _get_selected_edge_loops(bm)
-        if len(loops) < 2:
-            self.report({'ERROR'}, "至少需要选择 2 条边环")
-            return {'CANCELLED'}
-
-        # 2) 排序
-        sorted_loops = []
-        for loop in loops:
-            sorted_loops.append(_sort_loop_verts(loop))
-        sorted_loops = _sort_loops_top_to_bottom(sorted_loops)
-
-        # 2.5) 百褶裙处理：将每个环的顶点投影到拟合椭圆上
-        #      使用顶层环的坐标系和PCA轴作为共享帧，确保所有椭圆对齐
-        vert_ellipse_co = {}
-        shared_frame = None
-        for loop in sorted_loops:
-            ellipse_coords, frame = _fit_ellipse_coords(loop, shared_frame)
-            if shared_frame is None:
-                shared_frame = frame
-            for v, co in zip(loop, ellipse_coords):
-                vert_ellipse_co[v] = co
-
-        # 3) 获取前/后中轴顶点坐标
-        front_axis_co = bm.verts[props.front_axis_vert_index].co.copy()
-        back_axis_co = bm.verts[props.back_axis_vert_index].co.copy()
-
-        # 4) 构建网格完整邻接表
-        full_adj = {}
-        for e in bm.edges:
-            for v in e.verts:
-                if v not in full_adj:
-                    full_adj[v] = []
-            full_adj[e.verts[0]].append(e.verts[1])
-            full_adj[e.verts[1]].append(e.verts[0])
-
-        # 5) BFS 找上下环对应顶点
-        loop_connections = []
-        for i in range(len(sorted_loops) - 1):
-            lower_set = set(sorted_loops[i + 1])
-            all_loop_verts = set()
-            for loop in sorted_loops:
-                all_loop_verts.update(loop)
-            conn = {}
-            for start_v in sorted_loops[i]:
-                visited = {start_v}
-                queue = [start_v]
-                found = None
-                while queue:
-                    v = queue.pop(0)
-                    if v in lower_set:
-                        found = v
+def _snapshot_control_centers(snapshot_raw):
+    data = _parse_json_dict(snapshot_raw)
+    centers = []
+    for level in range(CONTROL_LEVELS):
+        points = []
+        for direction in CONTROL_DIRECTIONS:
+            name = _control_name("AutoSkirt_", direction, level)
+            suffix = f"CTRL_{direction}_L{level}"
+            value = data.get(name)
+            if value is None:
+                for key, candidate in data.items():
+                    if str(key).endswith(suffix):
+                        value = candidate
                         break
-                    for nb in full_adj.get(v, []):
-                        if nb not in visited:
-                            if nb in lower_set or nb not in all_loop_verts:
-                                visited.add(nb)
-                                queue.append(nb)
-                if found:
-                    conn[start_v] = found
-            loop_connections.append(conn)
+            point = _vector_from_json(value)
+            if point is not None:
+                points.append(point)
+        centers.append(_average_points(points) if points else Vector((0.0, 0.0, 0.0)))
+    return centers
 
-        # 6) 构建完整骨骼链
-        chains = []
-        for v in sorted_loops[0]:
-            chain = [v]
-            current = v
-            for conn in loop_connections:
-                if current not in conn:
-                    break
-                current = conn[current]
-                chain.append(current)
-            if len(chain) == len(sorted_loops):
-                chains.append(chain)
 
-        if not chains:
-            self.report({'ERROR'}, "上下环之间没有找到相连的顶点对")
-            return {'CANCELLED'}
+def _restore_control_positions(control_objects, snapshot_raw):
+    data = _parse_json_dict(snapshot_raw)
+    for obj in _flatten_control_objects(control_objects):
+        point = _vector_from_json(data.get(obj.name))
+        if point is not None:
+            obj.location = point
 
-        num_segments = len(sorted_loops) - 1
 
-        # 7) 使用椭圆PCA角度排序链，实现弧长均匀分布
-        top_loop = sorted_loops[0]
-        top_center = shared_frame['center']
+def _capture_hide_select_state(context, control_objects):
+    control_names = {obj.name for obj in _flatten_control_objects(control_objects)}
+    state = {
+        obj.name: bool(obj.hide_select)
+        for obj in context.view_layer.objects
+        if obj.name not in control_names
+    }
+    return json.dumps(state, separators=(",", ":"))
 
-        front_on_top = _find_closest_vert_in_loop(top_loop, front_axis_co)
-        back_on_top = _find_closest_vert_in_loop(top_loop, back_axis_co)
 
-        world_mat = obj.matrix_world
+def _restore_hide_select_state(context, settings):
+    data = _parse_json_dict(settings.control_edit_hide_select_state)
+    for name, hidden in data.items():
+        obj = bpy.data.objects.get(name)
+        if obj is not None and obj.name in context.view_layer.objects:
+            obj.hide_select = bool(hidden)
 
-        # 计算每个环的中心（基于椭圆投影坐标）
-        loop_centers = []
-        for loop in sorted_loops:
-            c = sum((world_mat @ vert_ellipse_co[v] for v in loop),
-                    Vector((0, 0, 0)))
-            c /= len(loop)
-            loop_centers.append(c)
 
-        # 使用顶层椭圆的PCA坐标系计算角度
-        ef = shared_frame
+def _select_only_controls(context, control_objects):
+    if context.active_object is not None and context.active_object.mode != 'OBJECT':
+        bpy.ops.object.mode_set(mode='OBJECT')
+    controls = _flatten_control_objects(control_objects)
+    control_names = {obj.name for obj in controls}
+    for obj in context.view_layer.objects:
+        try:
+            obj.select_set(obj.name in control_names)
+        except RuntimeError:
+            pass
+    if controls:
+        context.view_layer.objects.active = controls[0]
 
-        def _pca_angle(v):
-            """计算顶点在顶层椭圆PCA坐标系中的参数角度"""
-            d = v.co - top_center
-            px = d.dot(ef['ref'])
-            py = d.dot(ef['tangent'])
-            u = px * ef['ex1'][0] + py * ef['ex1'][1]
-            w = px * ef['ex2'][0] + py * ef['ex2'][1]
-            return math.atan2(w, u)
 
-        pca_front = _pca_angle(front_on_top)
-        pca_back = _pca_angle(back_on_top)
-        if pca_back <= pca_front:
-            pca_back += 2 * math.pi
+def _enter_control_edit_mode(context, settings, collection=None):
+    mesh_obj = _resolve_target_mesh(context, settings)
+    if mesh_obj is None or mesh_obj.type != 'MESH':
+        raise ValueError("Target Mesh 不存在")
+    if settings.target_mesh is None:
+        settings.target_mesh = mesh_obj
+    if collection is None:
+        collection_name = str(
+            mesh_obj.get(
+                PROP_COLLECTION,
+                _control_collection_name(settings.prefix, mesh_obj.name),
+            )
+        )
+        collection = bpy.data.collections.get(collection_name)
+    if collection is None:
+        raise ValueError("找不到控制点集合，请先生成控制点")
 
-        # 确保前后中轴链
-        front_chain = None
-        back_chain = None
-        for chain in chains:
-            if chain[0] == front_on_top:
-                front_chain = chain
-            elif chain[0] == back_on_top:
-                back_chain = chain
+    controls = find_control_points(collection, settings.prefix, require_all=True)
+    settings.control_edit_mesh_name = mesh_obj.name
+    settings.control_edit_snapshot = _json_position_map(controls)
+    settings.control_edit_last_positions = settings.control_edit_snapshot
+    settings.control_edit_hide_select_state = _capture_hide_select_state(context, controls)
+    settings.control_edit_active = True
 
-        # 收集前中轴到后中轴之间(+X侧)的所有链，按PCA角度排序
-        all_left_chains = []
-        for chain in chains:
-            head_v = chain[0]
-            if head_v == front_on_top or head_v == back_on_top:
-                continue
-            angle = _pca_angle(head_v)
-            if angle < pca_front:
-                angle += 2 * math.pi
-            if pca_front < angle < pca_back:
-                all_left_chains.append((angle, chain))
+    if context.active_object is not None and context.active_object.mode != 'OBJECT':
+        bpy.ops.object.mode_set(mode='OBJECT')
 
-        all_left_chains.sort(key=lambda x: x[0])
+    control_names = {obj.name for obj in _flatten_control_objects(controls)}
+    for obj in context.view_layer.objects:
+        if obj.name not in control_names:
+            obj.hide_select = True
+    _set_controls_locked(controls, False)
+    _select_only_controls(context, controls)
+    for area in context.screen.areas if context.screen else []:
+        area.tag_redraw()
+    return len(control_names)
 
-        # 8) 按 bone_count 在椭圆上等弧长选取 L 侧链
-        bone_count = max(1, props.bone_count)
-        if len(all_left_chains) <= bone_count:
-            left_chains = [chain for _, chain in all_left_chains]
+
+def _leave_control_edit_mode(context, settings, reset=False):
+    try:
+        mesh_obj, _collection, controls = _control_edit_collection(context, settings)
+        if reset:
+            _restore_control_positions(controls, settings.control_edit_snapshot)
+        _set_controls_locked(controls, True)
+        for obj in _flatten_control_objects(controls):
+            try:
+                obj.select_set(False)
+            except RuntimeError:
+                pass
+    except (ValueError, RuntimeError):
+        mesh_obj = bpy.data.objects.get(settings.control_edit_mesh_name)
+    _restore_hide_select_state(context, settings)
+
+    if mesh_obj is not None and mesh_obj.name in context.view_layer.objects:
+        if context.active_object is not None and context.active_object.mode != 'OBJECT':
+            try:
+                bpy.ops.object.mode_set(mode='OBJECT')
+            except RuntimeError:
+                pass
+        context.view_layer.objects.active = mesh_obj
+        try:
+            mesh_obj.select_set(True)
+        except RuntimeError:
+            pass
+
+    settings.control_edit_active = False
+    settings.control_edit_last_positions = ""
+    settings.control_edit_snapshot = ""
+    settings.control_edit_hide_select_state = ""
+    for area in context.screen.areas if context.screen else []:
+        area.tag_redraw()
+
+
+def _position_delta_squared(a, b):
+    va = _vector_from_json(a)
+    vb = _vector_from_json(b)
+    if va is None or vb is None:
+        return 0.0
+    return (va - vb).length_squared
+
+
+def _changed_control_names(current, previous):
+    changed = set()
+    for name, value in current.items():
+        if _position_delta_squared(value, previous.get(name)) > EDIT_SNAPSHOT_EPSILON:
+            changed.add(name)
+    return changed
+
+
+def _mirror_location(source, axis, center_value):
+    point = Vector(source)
+    if axis == 'X':
+        point.x = 2.0 * center_value - point.x
+    elif axis == 'Y':
+        point.y = 2.0 * center_value - point.y
+    return point
+
+
+def _choose_mirror_source(name_a, name_b, changed, active_name):
+    if active_name == name_a and name_a in changed:
+        return name_a, name_b
+    if active_name == name_b and name_b in changed:
+        return name_b, name_a
+    a_changed = name_a in changed
+    b_changed = name_b in changed
+    if a_changed and not b_changed:
+        return name_a, name_b
+    if b_changed and not a_changed:
+        return name_b, name_a
+    if a_changed and b_changed:
+        return name_a, name_b
+    return None, None
+
+
+def _apply_mirror_pair(control_objects, current, changed, active_name, direction_a, direction_b, level, axis, center_value):
+    obj_a = control_objects[direction_a][level]
+    obj_b = control_objects[direction_b][level]
+    source_name, target_name = _choose_mirror_source(
+        obj_a.name,
+        obj_b.name,
+        changed,
+        active_name,
+    )
+    if source_name is None:
+        return False
+    source_obj = bpy.data.objects.get(source_name)
+    target_obj = bpy.data.objects.get(target_name)
+    if source_obj is None or target_obj is None:
+        return False
+    target_obj.location = _mirror_location(source_obj.location, axis, center_value)
+    current[target_obj.name] = [
+        float(target_obj.location.x),
+        float(target_obj.location.y),
+        float(target_obj.location.z),
+    ]
+    return True
+
+
+def _apply_control_edit_mirror(context):
+    global _MIRROR_GUARD
+    if _MIRROR_GUARD:
+        return
+    scene = context.scene
+    if scene is None or not hasattr(scene, "auto_skirt_settings"):
+        return
+    settings = scene.auto_skirt_settings
+    if not settings.control_edit_active:
+        return
+    if not settings.control_mirror_x and not settings.control_mirror_y:
+        return
+
+    try:
+        _mesh_obj, _collection, controls = _control_edit_collection(context, settings)
+    except (ValueError, RuntimeError):
+        return
+
+    current = _control_position_map(controls)
+    previous = _parse_json_dict(settings.control_edit_last_positions)
+    changed = _changed_control_names(current, previous)
+    if not changed:
+        return
+
+    centers = _snapshot_control_centers(settings.control_edit_snapshot)
+    active_name = context.active_object.name if context.active_object else ""
+    _MIRROR_GUARD = True
+    try:
+        any_changed = False
+        for level in range(CONTROL_LEVELS):
+            center = centers[level]
+            if settings.control_mirror_x:
+                any_changed |= _apply_mirror_pair(
+                    controls,
+                    current,
+                    changed,
+                    active_name,
+                    "Left",
+                    "Right",
+                    level,
+                    'X',
+                    center.x,
+                )
+            if settings.control_mirror_y:
+                any_changed |= _apply_mirror_pair(
+                    controls,
+                    current,
+                    changed,
+                    active_name,
+                    "Front",
+                    "Back",
+                    level,
+                    'Y',
+                    center.y,
+                )
+        if any_changed:
+            current = _control_position_map(controls)
+        settings.control_edit_last_positions = json.dumps(current, separators=(",", ":"))
+    finally:
+        _MIRROR_GUARD = False
+
+
+@persistent
+def _auto_skirt_depsgraph_update(scene, depsgraph):
+    del depsgraph
+    if scene is None or not hasattr(scene, "auto_skirt_settings"):
+        return
+    if scene.auto_skirt_settings.control_edit_active:
+        _apply_control_edit_mirror(bpy.context)
+
+
+def _draw_control_edit_header(self, context):
+    scene = context.scene
+    if scene is None or not hasattr(scene, "auto_skirt_settings"):
+        return
+    settings = scene.auto_skirt_settings
+    if not settings.control_edit_active:
+        return
+    layout = self.layout
+    layout.separator_spacer()
+    row = layout.row(align=True)
+    row.label(text="控制点编辑", icon='EMPTY_AXIS')
+    row.prop(settings, "control_mirror_x", text="X 镜像")
+    row.prop(settings, "control_mirror_y", text="Y 镜像")
+    row.operator("auto_skirt.reset_control_edit", text="复原", icon='LOOP_BACK')
+    row.operator("auto_skirt.cancel_control_edit", text="取消", icon='CANCEL')
+    row.operator("auto_skirt.finish_control_edit", text="完成", icon='CHECKMARK')
+
+
+def _control_edit_selected_world_positions(scene):
+    """Return the persisted target-vertex positions for the edit overlay."""
+    if scene is None or not hasattr(scene, "auto_skirt_settings"):
+        return []
+    settings = scene.auto_skirt_settings
+    if not settings.control_edit_active:
+        return []
+
+    primary_mesh = bpy.data.objects.get(settings.control_edit_mesh_name)
+    if primary_mesh is None:
+        primary_mesh = settings.target_mesh
+    if primary_mesh is None or primary_mesh.type != 'MESH':
+        return []
+
+    positions = []
+    for mesh_obj in _stored_target_meshes(primary_mesh):
+        indices = _load_selected_indices(mesh_obj)
+        matrix_world = mesh_obj.matrix_world
+        positions.extend(
+            matrix_world @ mesh_obj.data.vertices[index].co
+            for index in indices
+            if 0 <= index < len(mesh_obj.data.vertices)
+        )
+    return positions
+
+
+def _control_edit_control_world_positions(scene):
+    """Return the 16 editable control Empty positions for the green overlay."""
+    if scene is None or not hasattr(scene, "auto_skirt_settings"):
+        return []
+    settings = scene.auto_skirt_settings
+    if not settings.control_edit_active:
+        return []
+    primary_mesh = bpy.data.objects.get(settings.control_edit_mesh_name)
+    if primary_mesh is None:
+        primary_mesh = settings.target_mesh
+    if primary_mesh is None or primary_mesh.type != 'MESH':
+        return []
+    collection_name = str(primary_mesh.get(
+        PROP_COLLECTION,
+        _control_collection_name(settings.prefix, primary_mesh.name),
+    ))
+    collection = bpy.data.collections.get(collection_name)
+    controls = find_control_points(collection, settings.prefix, require_all=False)
+    return [
+        obj.matrix_world.translation.copy()
+        for obj in _flatten_control_objects(controls)
+    ]
+
+
+def _draw_control_edit_selection_markers():
+    """Draw green controls and orange fitted target vertices."""
+    try:
+        control_positions = _control_edit_control_world_positions(bpy.context.scene)
+        selection_positions = _control_edit_selected_world_positions(bpy.context.scene)
+        if not control_positions and not selection_positions:
+            return
+        shader = gpu.shader.from_builtin('UNIFORM_COLOR')
+        gpu.state.blend_set('ALPHA')
+        gpu.state.depth_test_set('NONE')
+        shader.bind()
+        if control_positions:
+            gpu.state.point_size_set(15.0)
+            shader.uniform_float("color", (0.08, 1.0, 0.18, 1.0))
+            batch_for_shader(shader, 'POINTS', {"pos": control_positions}).draw(shader)
+        if selection_positions:
+            gpu.state.point_size_set(8.0)
+            shader.uniform_float("color", (1.0, 0.28, 0.04, 1.0))
+            batch_for_shader(shader, 'POINTS', {"pos": selection_positions}).draw(shader)
+    except (ReferenceError, RuntimeError):
+        # A viewport may be closing while Blender removes a draw handler.
+        pass
+    finally:
+        try:
+            gpu.state.point_size_set(1.0)
+            gpu.state.depth_test_set('LESS_EQUAL')
+            gpu.state.blend_set('NONE')
+        except RuntimeError:
+            pass
+
+
+def _remove_selection_marker_draw_handler():
+    global _SELECTION_MARKER_DRAW_HANDLE
+    if _SELECTION_MARKER_DRAW_HANDLE is not None:
+        try:
+            bpy.types.SpaceView3D.draw_handler_remove(
+                _SELECTION_MARKER_DRAW_HANDLE,
+                'WINDOW',
+            )
+        except (ReferenceError, RuntimeError):
+            pass
+        _SELECTION_MARKER_DRAW_HANDLE = None
+
+
+def _install_selection_marker_draw_handler():
+    global _SELECTION_MARKER_DRAW_HANDLE
+    _remove_selection_marker_draw_handler()
+    _SELECTION_MARKER_DRAW_HANDLE = bpy.types.SpaceView3D.draw_handler_add(
+        _draw_control_edit_selection_markers,
+        (),
+        'WINDOW',
+        'POST_VIEW',
+    )
+
+
+def _force_fixed_weight_defaults(settings):
+    # The cage is always a closed Front -> Right -> Back -> Left loop.
+    # Keep the legacy RNA value for older saved scenes, but never expose it
+    # as a user-facing choice.
+    settings.closed_loop = True
+    settings.top_blend_to_parent = True
+    settings.normalize_weights = True
+
+
+# ---------------------------------------------------------------------------
+# Control point fitting and cage interpolation
+# ---------------------------------------------------------------------------
+
+
+def _world_axes(armature_obj):
+    up = Vector((0.0, 0.0, 1.0))
+    right = Vector((1.0, 0.0, 0.0))
+    back = Vector((0.0, 1.0, 0.0))
+    if armature_obj is not None:
+        basis = armature_obj.matrix_world.to_3x3()
+        up = _safe_normalized(basis @ Vector((0.0, 0.0, 1.0)), up)
+        right = basis @ Vector((1.0, 0.0, 0.0))
+        back = basis @ Vector((0.0, 1.0, 0.0))
+
+    # Gram-Schmidt keeps all radial directions in the height-normal plane.
+    right -= up * right.dot(up)
+    right = _safe_normalized(right, Vector((1.0, 0.0, 0.0)))
+    back -= up * back.dot(up)
+    back -= right * back.dot(right)
+    back = _safe_normalized(back, up.cross(right))
+    if right.cross(back).dot(up) < 0.0:
+        back.negate()
+    return up, right, back
+
+
+def _fit_control_positions(records, armature_obj):
+    points = [item["world"].copy() for item in records]
+    if len(points) < 4:
+        raise ValueError("至少需要选择 4 个顶点来拟合控制笼")
+
+    up, right, back = _world_axes(armature_obj)
+    heights = [point.dot(up) for point in points]
+    h_top = max(heights)
+    h_bottom = min(heights)
+    total_height = h_top - h_bottom
+    if total_height <= EPSILON:
+        raise ValueError("所选顶点沿高度轴的范围过小，无法生成控制笼")
+
+    all_center = _average_points(points)
+    slice_band = max(total_height * 0.12, total_height / 30.0)
+    fallback_count = min(len(points), max(8, int(math.ceil(len(points) * 0.08))))
+
+    controls = {direction: [] for direction in CONTROL_DIRECTIONS}
+    direction_vectors = {
+        "Front": -back,
+        "Right": right,
+        "Back": back,
+        "Left": -right,
+    }
+
+    for level in range(CONTROL_LEVELS):
+        fraction = level / (CONTROL_LEVELS - 1)
+        target_h = h_top - total_height * fraction
+        nearby = [
+            point for point, height in zip(points, heights)
+            if abs(height - target_h) <= slice_band
+        ]
+        if len(nearby) < 3:
+            ordered = sorted(
+                zip(points, heights),
+                key=lambda pair: abs(pair[1] - target_h),
+            )
+            nearby = [pair[0] for pair in ordered[:fallback_count]]
+
+        center = _average_points(nearby) if nearby else all_center.copy()
+        center += up * (target_h - center.dot(up))
+
+        for direction in CONTROL_DIRECTIONS:
+            axis = direction_vectors[direction]
+            radius = max((point - center).dot(axis) for point in nearby)
+            if radius <= EPSILON:
+                radius = max((point - center).dot(axis) for point in points)
+            if radius <= EPSILON:
+                radial_distances = [
+                    ((point - center) - up * (point - center).dot(up)).length
+                    for point in points
+                ]
+                radius = max(max(radial_distances), total_height * 0.02)
+            controls[direction].append(center + axis * radius * 1.03)
+
+    # Remove sideways center drift while preserving each direction's taper.
+    # Front/Back share one Right-axis coordinate, so they form vertical lines
+    # in front view. Left/Right likewise share one Back-axis coordinate, so
+    # they form vertical lines in side view. This is evaluated in the
+    # armature-aligned frame rather than assuming literal World X/Y.
+    fixed_right = all_center.dot(right)
+    fixed_back = all_center.dot(back)
+    for level in range(CONTROL_LEVELS):
+        for direction in ("Front", "Back"):
+            point = controls[direction][level]
+            controls[direction][level] = point + right * (fixed_right - point.dot(right))
+        for direction in ("Right", "Left"):
+            point = controls[direction][level]
+            controls[direction][level] = point + back * (fixed_back - point.dot(back))
+
+    diagonal = max((point - all_center).length for point in points) * 2.0
+    display_size = max(diagonal * 0.025, total_height * 0.015, 0.001)
+    return controls, display_size
+
+
+def _create_or_update_controls(
+    mesh_obj,
+    settings,
+    controls,
+    display_size,
+    update_existing=False,
+):
+    collection_name = _control_collection_name(settings.prefix, mesh_obj.name)
+    collection = get_or_create_collection(collection_name)
+    existing = find_control_points(collection, settings.prefix, require_all=False)
+
+    if update_existing:
+        missing = [
+            _control_name(settings.prefix, direction, level)
+            for direction in CONTROL_DIRECTIONS
+            for level in range(CONTROL_LEVELS)
+            if level >= len(existing.get(direction, []))
+            or existing[direction][level] is None
+        ]
+        if missing:
+            raise ValueError(
+                "Refit 需要完整的 16 个控制点；缺少：" + ", ".join(missing[:4])
+            )
+
+    for direction in CONTROL_DIRECTIONS:
+        for level in range(CONTROL_LEVELS):
+            name = _control_name(settings.prefix, direction, level)
+            obj = bpy.data.objects.get(name)
+            if obj is None or obj.get(PROP_TARGET) != mesh_obj.name:
+                obj = bpy.data.objects.new(name, None)
+                collection.objects.link(obj)
+            elif collection.objects.get(obj.name) is None:
+                collection.objects.link(obj)
+
+            obj.empty_display_type = 'SPHERE'
+            obj.empty_display_size = display_size
+            obj.location = controls[direction][level]
+            obj.show_in_front = True
+            obj[PROP_TARGET] = mesh_obj.name
+            obj[PROP_KIND] = EDIT_KIND_CONTROL
+            obj["auto_skirt_direction"] = direction
+            obj["auto_skirt_level"] = level
+            _set_control_object_locked(obj, True)
+
+    _store_mesh_metadata(mesh_obj, settings, collection_name)
+    return collection
+
+
+def generate_control_points(context, settings):
+    mesh_objects = _resolve_target_meshes(
+        context, settings, prefer_edit_selection=True
+    )
+    if not mesh_objects:
+        raise ValueError("Target Mesh does not exist.")
+    if any(obj.mode != 'EDIT' for obj in mesh_objects):
+        raise ValueError("Keep every target mesh in Edit Mode and select vertices.")
+
+    records_by_mesh = []
+    combined_records = []
+    for mesh_obj in mesh_objects:
+        records = get_selected_vertices(mesh_obj)
+        if not records:
+            raise ValueError(
+                f"Mesh '{mesh_obj.name}' has no selected vertices."
+            )
+        records_by_mesh.append((mesh_obj, records))
+        combined_records.extend(records)
+
+    primary_mesh = mesh_objects[0]
+    settings.target_mesh = primary_mesh
+    _validate_prefix(settings.prefix)
+    old_prefix = str(primary_mesh.get(PROP_PREFIX, settings.prefix))
+    delete_generated_controls(old_prefix, primary_mesh.name)
+    if old_prefix != settings.prefix:
+        delete_generated_controls(settings.prefix, primary_mesh.name)
+
+    controls, display_size = _fit_control_positions(
+        combined_records, settings.target_armature
+    )
+    collection = _create_or_update_controls(
+        primary_mesh, settings, controls, display_size, update_existing=False
+    )
+    for mesh_obj, records in records_by_mesh:
+        _store_selection_records(mesh_obj, records)
+        _store_mesh_metadata(mesh_obj, settings, collection.name, mesh_objects)
+    return collection, len(combined_records)
+
+
+def _refit_control_points(context, settings):
+    mesh_objects = _resolve_target_meshes(
+        context, settings, prefer_edit_selection=True
+    )
+    if not mesh_objects:
+        raise ValueError("Target Mesh does not exist.")
+    if any(obj.mode != 'EDIT' for obj in mesh_objects):
+        raise ValueError("Keep every target mesh in Edit Mode before refitting.")
+
+    records_by_mesh = []
+    combined_records = []
+    for mesh_obj in mesh_objects:
+        records = get_selected_vertices(mesh_obj)
+        if not records:
+            raise ValueError(
+                f"Mesh '{mesh_obj.name}' has no selected vertices."
+            )
+        records_by_mesh.append((mesh_obj, records))
+        combined_records.extend(records)
+
+    primary_mesh = mesh_objects[0]
+    settings.target_mesh = primary_mesh
+    collection_name = str(
+        primary_mesh.get(
+            PROP_COLLECTION,
+            _control_collection_name(settings.prefix, primary_mesh.name),
+        )
+    )
+    collection = bpy.data.collections.get(collection_name)
+    if collection is None:
+        raise ValueError("Control Collection does not exist; generate controls first.")
+    find_control_points(collection, settings.prefix, require_all=True)
+
+    controls, display_size = _fit_control_positions(
+        combined_records, settings.target_armature
+    )
+    _create_or_update_controls(
+        primary_mesh, settings, controls, display_size, update_existing=True
+    )
+    for mesh_obj, records in records_by_mesh:
+        _store_selection_records(mesh_obj, records)
+        _store_mesh_metadata(mesh_obj, settings, collection.name, mesh_objects)
+    return len(combined_records)
+
+
+def find_control_points(collection, prefix, require_all=True):
+    result = {direction: [None] * CONTROL_LEVELS for direction in CONTROL_DIRECTIONS}
+    missing = []
+    for direction in CONTROL_DIRECTIONS:
+        for level in range(CONTROL_LEVELS):
+            name = _control_name(prefix, direction, level)
+            obj = collection.objects.get(name) if collection is not None else None
+            if obj is None or obj.type != 'EMPTY':
+                missing.append(name)
+            else:
+                result[direction][level] = obj
+    if require_all and missing:
+        raise ValueError(
+            "控制点不完整（需要 16 个）；缺少：" + ", ".join(missing[:6])
+        )
+    return result
+
+
+def _control_world_locations(control_objects):
+    result = {}
+    for direction in CONTROL_DIRECTIONS:
+        result[direction] = [
+            obj.matrix_world.translation.copy()
+            for obj in control_objects[direction]
+        ]
+    return result
+
+
+def interpolate_vertical_control(direction_points, v):
+    """
+    Stable four-level interpolation.
+
+    Piecewise linear interpolation with smoothstep easing is deliberately used
+    instead of an overshooting cubic spline, so results remain inside each pair
+    of neighboring controls.
+    """
+    if len(direction_points) != CONTROL_LEVELS:
+        raise ValueError("每个方向必须恰好包含 4 个控制点")
+    v = clamp(float(v), 0.0, 1.0)
+    scaled = v * (CONTROL_LEVELS - 1)
+    segment = min(int(math.floor(scaled)), CONTROL_LEVELS - 2)
+    factor = smoothstep(scaled - segment)
+    return Vector(direction_points[segment]).lerp(
+        Vector(direction_points[segment + 1]), factor
+    )
+
+
+def _cage_section(control_points, v):
+    section = {
+        direction: interpolate_vertical_control(control_points[direction], v)
+        for direction in CONTROL_DIRECTIONS
+    }
+    center = _average_points([section[name] for name in CONTROL_DIRECTIONS])
+    return section, center
+
+
+def _section_axes(section):
+    """Return a stable polar frame for one cage section.
+
+    The four control points define only the center, the local X/Y axes, and
+    four cardinal radius limits.  Bone-ring samples should not be placed on
+    the straight Front->Right->Back->Left boundary, otherwise the ring becomes
+    a diamond.
+    """
+    center = _average_points([section[name] for name in CONTROL_DIRECTIONS])
+    x_axis = _safe_normalized(
+        section["Right"] - section["Left"],
+        Vector((1.0, 0.0, 0.0)),
+    )
+    y_axis = section["Back"] - section["Front"]
+    y_axis -= x_axis * y_axis.dot(x_axis)
+    y_axis = _safe_normalized(y_axis, Vector((0.0, 1.0, 0.0)))
+    return center, x_axis, y_axis
+
+
+def _lerp_float(a, b, factor):
+    return float(a) * (1.0 - factor) + float(b) * factor
+
+
+def _smooth_periodic_radius(theta, r_front, r_right, r_back, r_left):
+    """Smooth radius interpolation at polar angle theta.
+
+    Cardinal angle convention in the section frame:
+    Front = -pi/2, Right = 0, Back = pi/2, Left = pi.
+    This returns a smooth r(theta) limit instead of a four-segment polygon
+    boundary length.
+    """
+    radii = [
+        max(float(r_front), EPSILON),
+        max(float(r_right), EPSILON),
+        max(float(r_back), EPSILON),
+        max(float(r_left), EPSILON),
+    ]
+    # phase 0 is Front, then Right, Back, Left, and back to Front.
+    phase = (float(theta) + math.pi * 0.5) % math.tau
+    sector_float = phase / (math.pi * 0.5)
+    sector = int(math.floor(sector_float)) % 4
+    t = sector_float - math.floor(sector_float)
+    # Cosine interpolation avoids the corner-like feel of linear cardinal radii.
+    t = (1.0 - math.cos(t * math.pi)) * 0.5
+    return _lerp_float(radii[sector], radii[(sector + 1) % 4], t)
+
+
+def _cage_boundary_point(section, u, closed_loop):
+    """Compatibility helper for UI/debug code.
+
+    The fitted bone ring no longer uses this four-control polyline.  It is
+    retained only for any external callers that still expect a boundary point.
+    """
+    center, x_axis, y_axis = _section_axes(section)
+    if closed_loop:
+        theta = -math.pi * 0.5 + math.tau * (u % 1.0)
+    else:
+        theta = -math.pi * 0.5 + math.pi * 1.5 * clamp(u, 0.0, 1.0)
+    radial = _safe_normalized(
+        math.cos(theta) * x_axis + math.sin(theta) * y_axis,
+        x_axis,
+    )
+    r_front = (section["Front"] - center).length
+    r_right = (section["Right"] - center).length
+    r_back = (section["Back"] - center).length
+    r_left = (section["Left"] - center).length
+    radius = _smooth_periodic_radius(theta, r_front, r_right, r_back, r_left)
+    return center + radial * radius
+
+def _cage_longitudinal_axis(control_points):
+    top_center = _average_points([
+        control_points[direction][0]
+        for direction in CONTROL_DIRECTIONS
+    ])
+    bottom_center = _average_points([
+        control_points[direction][-1]
+        for direction in CONTROL_DIRECTIONS
+    ])
+    return _safe_normalized(
+        bottom_center - top_center,
+        Vector((0.0, 0.0, -1.0)),
+    )
+
+
+def _surface_height_parameters(surface_points, control_points):
+    top_center = _average_points([
+        control_points[direction][0]
+        for direction in CONTROL_DIRECTIONS
+    ])
+    bottom_center = _average_points([
+        control_points[direction][-1]
+        for direction in CONTROL_DIRECTIONS
+    ])
+    vertical = bottom_center - top_center
+    if vertical.length_squared <= EPSILON:
+        return [0.0] * len(surface_points)
+    return [
+        clamp((point - top_center).dot(vertical) / vertical.length_squared, 0.0, 1.0)
+        for point in surface_points
+    ]
+
+
+def _cage_column_geometry(control_points, row_v, column, columns, closed_loop):
+    """Return polar geometry for one fitted-ring column.
+
+    This is intentionally angle/radius based.  The old implementation sampled
+    Front->Right->Back->Left as a four-edge polyline, which made every ring a
+    diamond no matter how many columns were requested.
+    """
+    section, _unused_center = _cage_section(control_points, row_v)
+    center, x_axis, y_axis = _section_axes(section)
+
+    if closed_loop:
+        u = column / columns
+        theta = -math.pi * 0.5 + math.tau * u
+    else:
+        u = column / max(columns - 1, 1)
+        theta = -math.pi * 0.5 + math.pi * 1.5 * clamp(u, 0.0, 1.0)
+
+    radial = _safe_normalized(
+        math.cos(theta) * x_axis + math.sin(theta) * y_axis,
+        x_axis,
+    )
+
+    r_front = (section["Front"] - center).length
+    r_right = (section["Right"] - center).length
+    r_back = (section["Back"] - center).length
+    r_left = (section["Left"] - center).length
+    cage_radius = _smooth_periodic_radius(
+        theta, r_front, r_right, r_back, r_left
+    )
+    cage_point = center + radial * cage_radius
+    return section, center, u, cage_point, radial, cage_radius
+
+
+def _clamp_point_to_cage(
+    point, control_points, row_v, column, columns, bone_inset, closed_loop
+):
+    _section, center, _u, _cage_point, radial, cage_radius = (
+        _cage_column_geometry(
+            control_points, row_v, column, columns, closed_loop
+        )
+    )
+    maximum = cage_radius * (1.0 - clamp(bone_inset, 0.0, 0.95))
+    radius = clamp((point - center).dot(radial), 0.0, maximum)
+    return center + radial * radius
+
+def _expanded_slice_indices(heights, row_h, slice_thickness, minimum_count=4):
+    thickness = clamp(float(slice_thickness), 0.001, 0.5)
+    selected = []
+    for _attempt in range(6):
+        selected = [
+            index for index, height in enumerate(heights)
+            if abs(height - row_h) <= thickness
+        ]
+        if len(selected) >= minimum_count:
+            return selected, thickness
+        if thickness >= 0.5:
+            break
+        thickness = min(thickness * 1.75, 0.5)
+
+    if heights:
+        nearest_count = min(len(heights), max(minimum_count, 8))
+        selected = sorted(
+            range(len(heights)),
+            key=lambda index: abs(heights[index] - row_h),
+        )[:nearest_count]
+        if selected:
+            thickness = max(
+                thickness,
+                max(abs(heights[index] - row_h) for index in selected) + 1.0e-6,
+            )
+    return selected, thickness
+
+
+def _weighted_point(points, weighted_indices, fallback):
+    total = sum(weight for _index, weight in weighted_indices)
+    if total <= EPSILON:
+        return Vector(fallback)
+    result = Vector((0.0, 0.0, 0.0))
+    for index, weight in weighted_indices:
+        result += points[index] * weight
+    return result / total
+
+
+def _weighted_normal(normals, weighted_indices, fallback):
+    if not normals or not weighted_indices:
+        return _safe_normalized(fallback, Vector((1.0, 0.0, 0.0)))
+    reference_index = max(weighted_indices, key=lambda item: item[1])[0]
+    reference = _safe_normalized(normals[reference_index], fallback)
+    result = Vector((0.0, 0.0, 0.0))
+    total = 0.0
+    for index, weight in weighted_indices:
+        normal = _safe_normalized(normals[index], reference)
+        if normal.dot(reference) < 0.0:
+            normal.negate()
+        result += normal * weight
+        total += weight
+    if total > EPSILON:
+        result /= total
+    return _safe_normalized(result, reference)
+
+
+def _fit_column_from_slice(
+    center,
+    radial,
+    cage_radius,
+    row_h,
+    candidate_indices,
+    effective_thickness,
+    surface_points,
+    surface_normals,
+    surface_heights,
+    fit_mode,
+    bone_inset,
+    ring_fit_strength,
+):
+    """Fit one column by radius, not by averaging world-space positions.
+
+    Averaging coordinates first can pull the fitted point sideways and then
+    project it back to the current ray.  Here the point cloud contributes only
+    a radius along the current polar direction, which preserves a smooth
+    theta -> r(theta) ring.
+    """
+    angular_threshold = 0.35
+    candidates = []
+    for index in candidate_indices:
+        delta = surface_points[index] - center
+        length = delta.length
+        if length <= EPSILON:
+            continue
+        radius = delta.dot(radial)
+        direction_score = delta.dot(radial) / length
+        if radius <= 0.0 or direction_score <= angular_threshold:
+            continue
+        height_score = clamp(
+            1.0 - abs(surface_heights[index] - row_h)
+            / max(effective_thickness, EPSILON),
+            0.001,
+            1.0,
+        )
+        weight = max(direction_score * height_score, EPSILON)
+        candidates.append((index, radius, weight))
+
+    maximum_radius = cage_radius * (
+        1.0 - clamp(float(bone_inset), 0.0, 0.95)
+    )
+    cage_inner = center + radial * maximum_radius
+    if not candidates:
+        return cage_inner, radial.copy()
+
+    mode = str(fit_mode).upper()
+    normal_candidates = []
+
+    if mode == 'MEDIAN':
+        radii = sorted(candidate[1] for candidate in candidates)
+        middle = len(radii) // 2
+        fit_radius = (
+            radii[middle]
+            if len(radii) % 2
+            else (radii[middle - 1] + radii[middle]) * 0.5
+        )
+        normal_candidates = [
+            (index, weight / (1.0 + abs(radius - fit_radius)))
+            for index, radius, weight in candidates
+        ]
+    else:
+        selected = candidates
+        if mode == 'OUTER_ENVELOPE':
+            top_k = min(5, len(candidates))
+            selected = sorted(
+                candidates, key=lambda item: item[1], reverse=True
+            )[:top_k]
+
+        total_weight = sum(weight for _index, _radius, weight in selected)
+        if total_weight <= EPSILON:
+            fit_radius = maximum_radius
         else:
-            # 计算等弧长目标角度
-            target_pca = _ellipse_equal_arc_angles(
-                ef['max_a'], ef['max_b'],
-                pca_front, pca_back, bone_count + 2)
+            fit_radius = sum(
+                radius * weight for _index, radius, weight in selected
+            ) / total_weight
+        normal_candidates = [
+            (index, weight) for index, _radius, weight in selected
+        ]
 
-            left_chains = []
-            used = set()
-            for i in range(1, bone_count + 1):
-                target = target_pca[i]
-                best_idx = None
-                best_diff = float('inf')
-                for j, (angle, chain) in enumerate(all_left_chains):
-                    if j in used:
-                        continue
-                    diff = abs(angle - target)
-                    if diff < best_diff:
-                        best_diff = diff
-                        best_idx = j
-                if best_idx is not None:
-                    used.add(best_idx)
-                    left_chains.append(all_left_chains[best_idx][1])
+    fit_radius = clamp(fit_radius, 0.0, maximum_radius)
+    final_radius = _lerp_float(
+        maximum_radius,
+        fit_radius,
+        clamp(float(ring_fit_strength), 0.0, 1.0),
+    )
+    final_point = center + radial * final_radius
+    final_normal = _weighted_normal(
+        surface_normals, normal_candidates, radial
+    )
+    return final_point, final_normal
 
-        # 9) 编排标签：前中轴(a) → 左侧按角度(b,c,d...+.L,镜像.R) → 后中轴
-        total_labels = (1 if front_chain else 0) + len(left_chains) + (1 if back_chain else 0)
-        label_idx = 0
-        labeled_chains = []
+def _smooth_normal_triplet(previous, current, following):
+    previous = Vector(previous)
+    current = Vector(current)
+    following = Vector(following)
+    if previous.dot(current) < 0.0:
+        previous.negate()
+    if following.dot(current) < 0.0:
+        following.negate()
+    return _safe_normalized(
+        previous * 0.25 + current * 0.5 + following * 0.25,
+        current,
+    )
 
-        # 前中轴
-        if front_chain:
-            coords = [world_mat @ vert_ellipse_co[v] for v in front_chain]
-            labeled_chains.append(
-                (_chain_label(label_idx, total_labels), coords, ""))
-            label_idx += 1
 
-        # 左侧链(.L) + 镜像(.R)
-        for chain in left_chains:
-            label = _chain_label(label_idx, total_labels)
-            coords = [world_mat @ vert_ellipse_co[v] for v in chain]
-            labeled_chains.append((label, coords, "L"))
-            mirrored = [Vector((-c.x, c.y, c.z)) for c in coords]
-            labeled_chains.append((label, mirrored, "R"))
-            label_idx += 1
+def sample_cage_row(
+    control_points,
+    row_v,
+    columns,
+    bone_inset,
+    closed_loop=True,
+    surface_points=None,
+    reference_control_points=None,
+    surface_heights=None,
+    slice_band=0.08,
+    surface_normals=None,
+    fit_mode='OUTER_ENVELOPE',
+    ring_fit_strength=1.0,
+    return_normals=False,
+):
+    """Fit one polar bone ring to the selected point-cloud height slice.
 
-        # 后中轴
-        if back_chain:
-            coords = [world_mat @ vert_ellipse_co[v] for v in back_chain]
-            labeled_chains.append(
-                (_chain_label(label_idx, total_labels), coords, ""))
-            label_idx += 1
+    The ring is smoothed as radii along fixed theta directions.  Smoothing
+    points directly can reintroduce polygonal bias, especially when the old
+    four-control boundary is not meant to be the final shape.
+    """
+    del reference_control_points
+    if columns < 4:
+        raise ValueError("环向骨骼数必须至少为 4")
+    surface_points = surface_points or []
+    surface_normals = surface_normals or []
+    if len(surface_normals) != len(surface_points):
+        surface_normals = []
+    if surface_heights is None and surface_points:
+        surface_heights = _surface_height_parameters(
+            surface_points, control_points
+        )
+    surface_heights = surface_heights or []
+    candidate_indices, effective_thickness = _expanded_slice_indices(
+        surface_heights, row_v, slice_band
+    )
 
-        if not labeled_chains:
-            self.report({'ERROR'}, "没有找到可生成的骨骼链")
+    samples = []
+    normals = []
+    centers = []
+    radials = []
+    max_radii = []
+    fitted_radii = []
+
+    for column in range(columns):
+        _section, center, _u, _cage_point, radial, cage_radius = (
+            _cage_column_geometry(
+                control_points, row_v, column, columns, closed_loop
+            )
+        )
+        point, normal = _fit_column_from_slice(
+            center,
+            radial,
+            cage_radius,
+            row_v,
+            candidate_indices,
+            effective_thickness,
+            surface_points,
+            surface_normals,
+            surface_heights,
+            fit_mode,
+            bone_inset,
+            ring_fit_strength,
+        )
+        maximum = cage_radius * (1.0 - clamp(float(bone_inset), 0.0, 0.95))
+        radius = clamp((point - center).dot(radial), 0.0, maximum)
+        centers.append(center)
+        radials.append(radial)
+        max_radii.append(maximum)
+        fitted_radii.append(radius)
+        samples.append(center + radial * radius)
+        normals.append(normal)
+
+    # One circumferential smoothing pass on r(theta), followed by clamping.
+    smoothed_points = []
+    smoothed_normals = []
+    for column in range(columns):
+        previous = (column - 1) % columns if closed_loop else max(column - 1, 0)
+        following = (column + 1) % columns if closed_loop else min(column + 1, columns - 1)
+        radius = (
+            fitted_radii[previous] * 0.25
+            + fitted_radii[column] * 0.5
+            + fitted_radii[following] * 0.25
+        )
+        radius = clamp(radius, 0.0, max_radii[column])
+        point = centers[column] + radials[column] * radius
+        smoothed_points.append(_clamp_point_to_cage(
+            point,
+            control_points,
+            row_v,
+            column,
+            columns,
+            bone_inset,
+            closed_loop,
+        ))
+        smoothed_normals.append(_smooth_normal_triplet(
+            normals[previous], normals[column], normals[following]
+        ))
+
+    if return_normals:
+        return smoothed_points, smoothed_normals
+    return smoothed_points
+
+def build_cage_samples(
+    control_points,
+    rows,
+    columns,
+    bone_inset,
+    closed_loop=True,
+    surface_points=None,
+    reference_control_points=None,
+    surface_normals=None,
+    slice_thickness=0.08,
+    fit_mode='OUTER_ENVELOPE',
+    ring_fit_strength=1.0,
+    longitudinal_smoothing=True,
+    return_normals=False,
+):
+    if rows < 2:
+        raise ValueError("纵向层数必须至少为 2")
+    del reference_control_points
+    surface_points = surface_points or []
+    surface_normals = surface_normals or []
+    if len(surface_normals) != len(surface_points):
+        surface_normals = []
+    surface_heights = (
+        _surface_height_parameters(surface_points, control_points)
+        if surface_points else []
+    )
+    samples = []
+    normals = []
+    for row in range(rows):
+        row_points, row_normals = sample_cage_row(
+            control_points,
+            row / (rows - 1),
+            columns,
+            bone_inset,
+            closed_loop,
+            surface_points,
+            None,
+            surface_heights,
+            slice_thickness,
+            surface_normals,
+            fit_mode,
+            ring_fit_strength,
+            True,
+        )
+        samples.append(row_points)
+        normals.append(row_normals)
+
+    if longitudinal_smoothing and rows > 2:
+        smoothed_samples = [[point.copy() for point in row] for row in samples]
+        smoothed_normals = [[normal.copy() for normal in row] for row in normals]
+        for row in range(1, rows - 1):
+            row_v = row / (rows - 1)
+            for column in range(columns):
+                point = (
+                    samples[row - 1][column] * 0.2
+                    + samples[row][column] * 0.6
+                    + samples[row + 1][column] * 0.2
+                )
+                smoothed_samples[row][column] = _clamp_point_to_cage(
+                    point,
+                    control_points,
+                    row_v,
+                    column,
+                    columns,
+                    bone_inset,
+                    closed_loop,
+                )
+                previous_normal = normals[row - 1][column].copy()
+                current_normal = normals[row][column].copy()
+                following_normal = normals[row + 1][column].copy()
+                if previous_normal.dot(current_normal) < 0.0:
+                    previous_normal.negate()
+                if following_normal.dot(current_normal) < 0.0:
+                    following_normal.negate()
+                smoothed_normals[row][column] = _safe_normalized(
+                    previous_normal * 0.2
+                    + current_normal * 0.6
+                    + following_normal * 0.2,
+                    current_normal,
+                )
+        samples = smoothed_samples
+        normals = smoothed_normals
+
+    if return_normals:
+        return samples, normals
+    return samples
+
+
+# ---------------------------------------------------------------------------
+# Bone generation
+# ---------------------------------------------------------------------------
+
+
+def cleanup_generated_bones(armature, prefix):
+    """Remove prefix-matching edit bones. Armature must be in Edit Mode."""
+    if armature.type != 'ARMATURE' or armature.mode != 'EDIT':
+        raise ValueError("清理骨骼时 Armature 必须处于 Edit Mode")
+    removed = 0
+    for bone in list(armature.data.edit_bones):
+        if bone.name.startswith(prefix):
+            armature.data.edit_bones.remove(bone)
+            removed += 1
+    return removed
+
+
+def _ring_tangent(samples, row, column, closed_loop):
+    columns = len(samples[row])
+    if closed_loop:
+        previous = samples[row][(column - 1) % columns]
+        following = samples[row][(column + 1) % columns]
+    elif column == 0:
+        previous = samples[row][0]
+        following = samples[row][1]
+    elif column == columns - 1:
+        previous = samples[row][-2]
+        following = samples[row][-1]
+    else:
+        previous = samples[row][column - 1]
+        following = samples[row][column + 1]
+    return following - previous
+
+
+def _align_bone_roll(bone, tangent):
+    longitudinal = bone.tail - bone.head
+    if longitudinal.length_squared <= EPSILON:
+        return
+    tangent = Vector(tangent)
+    tangent -= longitudinal.normalized() * tangent.dot(longitudinal.normalized())
+    if tangent.length_squared > EPSILON:
+        bone.align_roll(tangent.normalized())
+
+
+def _point_at_polyline_arc(points, cumulative, distance):
+    distance = clamp(distance, 0.0, cumulative[-1])
+    for segment in range(len(points) - 1):
+        if distance <= cumulative[segment + 1] + EPSILON:
+            span = cumulative[segment + 1] - cumulative[segment]
+            if span <= EPSILON:
+                return points[segment].copy()
+            factor = (distance - cumulative[segment]) / span
+            return points[segment].lerp(points[segment + 1], factor)
+    return points[-1].copy()
+
+
+def _equal_chord_chain(polyline, bone_count):
+    """Return bone_count + 1 connected curve points with equal chord lengths."""
+    points = []
+    for point in polyline:
+        point = Vector(point)
+        if not points or (point - points[-1]).length_squared > EPSILON:
+            points.append(point.copy())
+    if len(points) < 2:
+        origin = points[0] if points else Vector((0.0, 0.0, 0.0))
+        return [origin + Vector((0.0, 0.0, -0.001 * i)) for i in range(bone_count + 1)]
+
+    cumulative_arc = [0.0]
+    for index in range(len(points) - 1):
+        cumulative_arc.append(
+            cumulative_arc[-1] + (points[index + 1] - points[index]).length
+        )
+    total_arc = cumulative_arc[-1]
+    if total_arc <= EPSILON:
+        return [points[0].copy() for _index in range(bone_count + 1)]
+
+    # Start with equal arc-length positions, then repeatedly redistribute the
+    # arc parameters according to cumulative chord length. The fixed point of
+    # this mapping has equal straight bone lengths while every joint remains
+    # on the original sampled curve and both endpoints stay fixed.
+    parameters = [
+        total_arc * index / bone_count
+        for index in range(bone_count + 1)
+    ]
+    for _iteration in range(200):
+        chain = [
+            _point_at_polyline_arc(points, cumulative_arc, parameter)
+            for parameter in parameters
+        ]
+        lengths = [
+            (chain[index + 1] - chain[index]).length
+            for index in range(bone_count)
+        ]
+        if max(lengths) - min(lengths) <= max(total_arc * 1.0e-10, 1.0e-9):
+            return chain
+
+        cumulative_chord = [0.0]
+        for length in lengths:
+            cumulative_chord.append(cumulative_chord[-1] + length)
+        total_chord = cumulative_chord[-1]
+        if total_chord <= EPSILON:
+            break
+
+        redistributed = [0.0]
+        for index in range(1, bone_count):
+            target = total_chord * index / bone_count
+            segment = 0
+            while (
+                segment < bone_count - 1
+                and cumulative_chord[segment + 1] < target
+            ):
+                segment += 1
+            span = cumulative_chord[segment + 1] - cumulative_chord[segment]
+            factor = 0.0 if span <= EPSILON else (
+                (target - cumulative_chord[segment]) / span
+            )
+            redistributed.append(
+                parameters[segment]
+                + (parameters[segment + 1] - parameters[segment]) * factor
+            )
+        redistributed.append(total_arc)
+
+        # Damping prevents oscillation when a joint crosses an original
+        # polyline corner. Endpoints remain exactly pinned.
+        parameters = [
+            0.0 if index == 0 else (
+                total_arc if index == bone_count else
+                parameters[index] * 0.2 + redistributed[index] * 0.8
+            )
+            for index in range(bone_count + 1)
+        ]
+
+    chain = [
+        _point_at_polyline_arc(points, cumulative_arc, parameter)
+        for parameter in parameters
+    ]
+    spread = max(
+        (chain[index + 1] - chain[index]).length
+        for index in range(bone_count)
+    ) - min(
+        (chain[index + 1] - chain[index]).length
+        for index in range(bone_count)
+    )
+    if spread > max(total_arc * 1.0e-5, 1.0e-6):
+        # Extremely pathological curves fall back to a straight in-cage chain
+        # so connection, equal size, and the bottom boundary remain strict.
+        return [
+            points[0].lerp(points[-1], index / bone_count)
+            for index in range(bone_count + 1)
+        ]
+    return chain
+
+
+def _interpolate_vector_on_polyline(points, vectors, target, fallback):
+    if not vectors or len(vectors) != len(points):
+        return _safe_normalized(fallback, Vector((1.0, 0.0, 0.0)))
+    best_distance = float('inf')
+    best_vector = Vector(vectors[0])
+    for index in range(len(points) - 1):
+        start = points[index]
+        segment = points[index + 1] - start
+        if segment.length_squared <= EPSILON:
+            factor = 0.0
+        else:
+            factor = clamp(
+                (target - start).dot(segment) / segment.length_squared,
+                0.0,
+                1.0,
+            )
+        closest = start + segment * factor
+        distance = (target - closest).length_squared
+        if distance < best_distance:
+            best_distance = distance
+            first = Vector(vectors[index])
+            second = Vector(vectors[index + 1])
+            if first.dot(second) < 0.0:
+                second.negate()
+            best_vector = first.lerp(second, factor)
+    return _safe_normalized(best_vector, fallback)
+
+
+def _get_or_create_bone_collection(armature_data, collection_name):
+    """Return an existing Bone Collection, or create the requested top-level one."""
+    name = str(collection_name or "").strip()
+    if not name:
+        return None
+    collection = armature_data.collections.get(name)
+    if collection is None:
+        collection = armature_data.collections.new(name)
+    return collection
+
+
+def create_bones_from_samples(
+    armature,
+    samples,
+    parent_bone_name,
+    prefix,
+    generate_end_bones,
+    closed_loop=True,
+    sample_normals=None,
+    bone_collection_name="",
+):
+    # Kept in the public signature for file/API compatibility. End bones are
+    # intentionally not generated anymore.
+    del generate_end_bones, closed_loop
+    if armature.type != 'ARMATURE' or armature.mode != 'EDIT':
+        raise ValueError("创建骨骼时 Armature 必须处于编辑模式")
+    rows = len(samples)
+    columns = len(samples[0]) if samples else 0
+    if rows < 2 or columns < 4:
+        raise ValueError("骨骼采样数据无效")
+
+    edit_bones = armature.data.edit_bones
+    bone_collection = _get_or_create_bone_collection(
+        armature.data,
+        bone_collection_name,
+    )
+    parent_bone = edit_bones.get(parent_bone_name)
+    if parent_bone is None:
+        raise ValueError(f"找不到父骨骼：{parent_bone_name}")
+
+    inverse = armature.matrix_world.inverted()
+    normal_to_local = armature.matrix_world.to_3x3().transposed()
+    local_samples = [
+        [inverse @ point for point in row_points]
+        for row_points in samples
+    ]
+
+    requested_names = {
+        _bone_name(prefix, column, row)
+        for column in range(columns)
+        for row in range(rows)
+    }
+    temporary_names = {
+        _temporary_bone_name(prefix, column, row)
+        for column in range(columns)
+        for row in range(rows)
+    }
+    conflicts = sorted(
+        name for name in requested_names | temporary_names if edit_bones.get(name)
+    )
+    if conflicts:
+        raise ValueError(
+            "已存在同名生成骨骼；请启用“清除已有生成骨骼”："
+            + ", ".join(conflicts[:4])
+        )
+
+    chains = [
+        _equal_chord_chain(
+            [local_samples[row][column] for row in range(rows)],
+            rows,
+        )
+        for column in range(columns)
+    ]
+    local_sample_normals = None
+    if sample_normals:
+        local_sample_normals = [
+            [
+                _safe_normalized(
+                    normal_to_local @ sample_normals[row][column],
+                    Vector((1.0, 0.0, 0.0)),
+                )
+                for column in range(columns)
+            ]
+            for row in range(rows)
+        ]
+
+    created = []
+    renamed_bones = []
+    for column in range(columns):
+        previous_bone = None
+        chain = chains[column]
+        source_polyline = [local_samples[row][column] for row in range(rows)]
+        source_normals = (
+            [local_sample_normals[row][column] for row in range(rows)]
+            if local_sample_normals else []
+        )
+        for row in range(rows):
+            final_name = _bone_name(prefix, column, row)
+            # Geometry and roll are created under a physical column name.
+            # Optional .L/.R suffixes are applied only after all axes are final.
+            bone = edit_bones.new(_temporary_bone_name(prefix, column, row))
+            bone.head = chain[row]
+            bone.tail = chain[row + 1]
+            bone.parent = parent_bone if row == 0 else previous_bone
+            bone.use_connect = row > 0
+            bone.use_deform = True
+            if bone_collection is not None:
+                bone_collection.assign(bone)
+
+            # Bone local +Z follows the fitted selected-vertex normal. The
+            # target is interpolated at the resampled chain head; align_roll
+            # projects only the unavoidable component parallel to bone +Y.
+            fitted_normal = _interpolate_vector_on_polyline(
+                source_polyline,
+                source_normals,
+                chain[row],
+                Vector((1.0, 0.0, 0.0)),
+            )
+            _align_bone_roll(bone, fitted_normal)
+            created.append(final_name)
+            renamed_bones.append((bone, final_name))
+            previous_bone = bone
+
+    for bone, final_name in renamed_bones:
+        bone.name = final_name
+        if bone.name != final_name:
+            raise ValueError(f"Could not assign generated bone name: {final_name}")
+    return created
+
+
+# ---------------------------------------------------------------------------
+# Cage parameterization and weights
+# ---------------------------------------------------------------------------
+
+
+def compute_vertex_cage_parameters(
+    vertex_world_pos,
+    control_points,
+    closed_loop=True,
+):
+    top_center = _average_points([
+        control_points[direction][0] for direction in CONTROL_DIRECTIONS
+    ])
+    bottom_center = _average_points([
+        control_points[direction][-1] for direction in CONTROL_DIRECTIONS
+    ])
+    vertical = bottom_center - top_center
+    if vertical.length_squared <= EPSILON:
+        raise ValueError("控制笼顶部和底部中心重合，无法计算纵向参数")
+
+    point = Vector(vertex_world_pos)
+    h = clamp(
+        (point - top_center).dot(vertical) / vertical.length_squared,
+        0.0,
+        1.0,
+    )
+    section, center = _cage_section(control_points, h)
+
+    x_axis = section["Right"] - section["Left"]
+    x_axis = _safe_normalized(x_axis, Vector((1.0, 0.0, 0.0)))
+    y_axis = section["Back"] - section["Front"]
+    y_axis -= x_axis * y_axis.dot(x_axis)
+    y_axis = _safe_normalized(y_axis, Vector((0.0, 1.0, 0.0)))
+
+    delta = point - center
+    x = delta.dot(x_axis)
+    y = delta.dot(y_axis)
+    if x * x + y * y <= EPSILON:
+        # The angle is undefined near the center. Use the closest cardinal point.
+        distances = [
+            (point - section[direction]).length_squared
+            for direction in CONTROL_DIRECTIONS
+        ]
+        cardinal = min(range(4), key=lambda index: distances[index])
+        u = cardinal / (4.0 if closed_loop else 3.0)
+        return h, clamp(u, 0.0, 1.0)
+
+    angle = math.atan2(y, x)
+    phase = (angle + math.pi * 0.5) % math.tau
+    if closed_loop:
+        u = phase / math.tau
+    else:
+        open_span = math.pi * 1.5
+        if phase <= open_span:
+            u = phase / open_span
+        else:
+            # The omitted Left->Front quadrant maps to its nearest open endpoint.
+            distance_to_left = phase - open_span
+            distance_to_front = math.tau - phase
+            u = 1.0 if distance_to_left <= distance_to_front else 0.0
+    return h, clamp(u, 0.0, 1.0)
+
+
+def _vertical_weights(t, curve):
+    t = clamp(t, 0.0, 1.0)
+    if curve == 'COSINE':
+        first = (math.cos(math.pi * t) + 1.0) * 0.5
+    elif curve == 'SHARP':
+        first = clamp(
+            (1.0 - math.tanh(2.0 * math.pi * abs(t) - math.pi)) * 0.5,
+            0.0,
+            1.0,
+        )
+    else:
+        first = 1.0 - t
+    return first, 1.0 - first
+
+
+def compute_vertex_weights(
+    vertex_world_pos,
+    h,
+    u,
+    rows,
+    columns,
+    prefix,
+    settings,
+):
+    del vertex_world_pos  # Kept in the public signature for future projection methods.
+    row_value = clamp(h, 0.0, 1.0) * (rows - 1)
+    row0 = min(int(math.floor(row_value)), rows - 1)
+    row1 = min(row0 + 1, rows - 1)
+    t = row_value - math.floor(row_value)
+    row_weight0, row_weight1 = _vertical_weights(t, settings.weight_curve)
+
+    if settings.closed_loop:
+        column_value = (u % 1.0) * columns
+        base_column = int(math.floor(column_value))
+        column0 = base_column % columns
+        column1 = (column0 + 1) % columns
+        s = column_value - base_column
+    else:
+        column_value = clamp(u, 0.0, 1.0) * (columns - 1)
+        column0 = min(int(math.floor(column_value)), columns - 1)
+        column1 = min(column0 + 1, columns - 1)
+        s = column_value - math.floor(column_value)
+
+    column_weight1 = smoothstep(s)
+    column_weight0 = 1.0 - column_weight1
+    weights = {}
+    contributions = (
+        (row0, column0, row_weight0 * column_weight0),
+        (row0, column1, row_weight0 * column_weight1),
+        (row1, column0, row_weight1 * column_weight0),
+        (row1, column1, row_weight1 * column_weight1),
+    )
+    for row, column, value in contributions:
+        name = _bone_name(prefix, column, row)
+        weights[name] = weights.get(name, 0.0) + value
+
+    parent_weight = 0.0
+    if settings.top_blend_to_parent and h < settings.top_blend_height:
+        blend_position = h / max(settings.top_blend_height, EPSILON)
+        parent_weight = 1.0 - smoothstep(blend_position)
+        skirt_scale = 1.0 - parent_weight
+        weights = {name: value * skirt_scale for name, value in weights.items()}
+
+    weights = {
+        name: value for name, value in weights.items()
+        if value >= MIN_WEIGHT
+    }
+
+    # Parent is guaranteed a slot, as selected in the design interview.
+    parent_is_active = parent_weight >= MIN_WEIGHT
+    skirt_slots = settings.max_influences - (1 if parent_is_active else 0)
+    sorted_skirt = sorted(weights.items(), key=lambda item: item[1], reverse=True)
+    weights = dict(sorted_skirt[:max(skirt_slots, 0)])
+    if parent_is_active:
+        weights[PARENT_WEIGHT_KEY] = parent_weight
+
+    if settings.normalize_weights:
+        total = sum(weights.values())
+        if total > EPSILON:
+            weights = {name: value / total for name, value in weights.items()}
+    return weights
+
+
+def apply_weights(
+    mesh_obj,
+    selected_indices,
+    weights,
+    prefix,
+    parent_bone_name,
+    clear_existing_generated_groups=True,
+    top_blend_to_parent=True,
+):
+    if mesh_obj.type != 'MESH' or mesh_obj.mode != 'OBJECT':
+        raise ValueError("写入权重时 Target Mesh 必须处于 Object Mode")
+    selected_indices = sorted(set(selected_indices))
+    if not selected_indices:
+        raise ValueError("没有可用于赋权的已记录顶点")
+
+    prefix_groups = [
+        group for group in mesh_obj.vertex_groups
+        if group.name.startswith(prefix)
+    ]
+    if clear_existing_generated_groups:
+        for group in prefix_groups:
+            mesh_obj.vertex_groups.remove(group)
+    else:
+        for group in prefix_groups:
+            try:
+                group.remove(selected_indices)
+            except RuntimeError:
+                pass
+
+    needed_names = {
+        name
+        for vertex_weights in weights.values()
+        for name in vertex_weights
+        if name != PARENT_WEIGHT_KEY
+    }
+    groups = {}
+    for name in needed_names:
+        group = mesh_obj.vertex_groups.get(name)
+        if group is None:
+            group = mesh_obj.vertex_groups.new(name=name)
+        groups[name] = group
+
+    parent_group = None
+    if top_blend_to_parent:
+        parent_group = mesh_obj.vertex_groups.get(parent_bone_name)
+        if parent_group is None:
+            parent_group = mesh_obj.vertex_groups.new(name=parent_bone_name)
+        try:
+            parent_group.remove(selected_indices)
+        except RuntimeError:
+            pass
+
+    assignment_count = 0
+    for vertex_index in selected_indices:
+        vertex_weights = weights.get(vertex_index, {})
+        for name, value in vertex_weights.items():
+            if value < MIN_WEIGHT:
+                continue
+            if name == PARENT_WEIGHT_KEY:
+                if parent_group is not None:
+                    parent_group.add([vertex_index], value, 'REPLACE')
+                    assignment_count += 1
+            else:
+                groups[name].add([vertex_index], value, 'REPLACE')
+                assignment_count += 1
+    return assignment_count
+
+
+def _ensure_armature_modifier(mesh_obj, armature_obj):
+    for modifier in mesh_obj.modifiers:
+        if modifier.type == 'ARMATURE' and modifier.object == armature_obj:
+            return modifier, False
+    modifier = mesh_obj.modifiers.new(
+        name=f"{_prefix_stem(armature_obj.name)} Armature",
+        type='ARMATURE',
+    )
+    modifier.object = armature_obj
+    return modifier, True
+
+
+# ---------------------------------------------------------------------------
+# Debug curves
+# ---------------------------------------------------------------------------
+
+
+def _new_poly_curve(name, points, collection, cyclic, bevel_depth, mesh_name):
+    curve_data = bpy.data.curves.new(name=name, type='CURVE')
+    curve_data.dimensions = '3D'
+    curve_data.resolution_u = 1
+    curve_data.bevel_depth = bevel_depth
+    curve_data.bevel_resolution = 1
+    spline = curve_data.splines.new(type='POLY')
+    spline.points.add(len(points) - 1)
+    for index, point in enumerate(points):
+        spline.points[index].co = (*point, 1.0)
+    spline.use_cyclic_u = cyclic
+
+    obj = bpy.data.objects.new(name, curve_data)
+    collection.objects.link(obj)
+    obj.show_in_front = True
+    obj.hide_render = True
+    obj[PROP_TARGET] = mesh_name
+    obj[PROP_KIND] = "DEBUG"
+    return obj
+
+
+def create_debug_curves(
+    samples,
+    prefix="AutoSkirt_",
+    mesh_name="Mesh",
+    closed_loop=True,
+):
+    _delete_debug_objects(prefix, mesh_name)
+    collection = get_or_create_collection(_debug_collection_name(prefix, mesh_name))
+    rows = len(samples)
+    columns = len(samples[0])
+    segment_lengths = [
+        (samples[row + 1][column] - samples[row][column]).length
+        for row in range(rows - 1)
+        for column in range(columns)
+    ]
+    typical_length = (
+        sum(segment_lengths) / len(segment_lengths) if segment_lengths else 0.1
+    )
+    bevel_depth = max(typical_length * 0.015, 0.0001)
+
+    objects = []
+    for row, points in enumerate(samples):
+        objects.append(_new_poly_curve(
+            f"{prefix}DEBUG_Row_{row:02d}",
+            points,
+            collection,
+            closed_loop,
+            bevel_depth,
+            mesh_name,
+        ))
+    for column in range(columns):
+        points = [samples[row][column] for row in range(rows)]
+        objects.append(_new_poly_curve(
+            f"{prefix}DEBUG_Column_{column:02d}",
+            points,
+            collection,
+            False,
+            bevel_depth,
+            mesh_name,
+        ))
+    return objects
+
+
+
+def _uniform_proxy_row_samples(samples):
+    """Resample proxy rows by average vertical arc length.
+
+    The bone samples remain untouched.  Only the display proxy is reparameterized
+    so its horizontal loop edges are evenly distributed down the fitted shape.
+    """
+    rows = len(samples)
+    columns = len(samples[0]) if rows else 0
+    if rows < 3 or columns < 1:
+        return [[Vector(point) for point in row] for row in samples]
+
+    cumulative = [0.0]
+    for row in range(1, rows):
+        lengths = [
+            (Vector(samples[row][column]) - Vector(samples[row - 1][column])).length
+            for column in range(columns)
+        ]
+        cumulative.append(cumulative[-1] + sum(lengths) / len(lengths))
+
+    total_length = cumulative[-1]
+    if total_length <= EPSILON:
+        return [[Vector(point) for point in row] for row in samples]
+
+    result = []
+    source_row = 0
+    for target_row in range(rows):
+        target_distance = total_length * target_row / (rows - 1)
+        while (
+            source_row < rows - 2
+            and cumulative[source_row + 1] < target_distance
+        ):
+            source_row += 1
+        start = cumulative[source_row]
+        end = cumulative[source_row + 1]
+        factor = (
+            (target_distance - start) / (end - start)
+            if end - start > EPSILON else 0.0
+        )
+        result.append([
+            Vector(samples[source_row][column]).lerp(
+                Vector(samples[source_row + 1][column]),
+                factor,
+            )
+            for column in range(columns)
+        ])
+    return result
+
+
+def _proxy_grid_vertex_normals(samples, closed_loop=True):
+    """Calculate the actual proxy-grid vertex normals from its face winding."""
+    rows = len(samples)
+    columns = len(samples[0]) if rows else 0
+    if rows < 2 or columns < 2:
+        return []
+
+    normals = []
+    for row in range(rows):
+        previous_row = max(row - 1, 0)
+        next_row = min(row + 1, rows - 1)
+        row_center = _average_points(samples[row])
+        row_normals = []
+        for column in range(columns):
+            if closed_loop:
+                previous_column = (column - 1) % columns
+                next_column = (column + 1) % columns
+            else:
+                previous_column = max(column - 1, 0)
+                next_column = min(column + 1, columns - 1)
+
+            horizontal = (
+                Vector(samples[row][next_column])
+                - Vector(samples[row][previous_column])
+            )
+            vertical = (
+                Vector(samples[next_row][column])
+                - Vector(samples[previous_row][column])
+            )
+            # This cross product follows create_proxy_mesh() face winding.
+            # Its fallback also points toward the proxy interior.
+            inward = horizontal.cross(vertical)
+            inward = _safe_normalized(
+                inward,
+                row_center - Vector(samples[row][column]),
+            )
+            row_normals.append(inward)
+        normals.append(row_normals)
+    return normals
+
+
+def create_proxy_mesh(
+    samples,
+    prefix="AutoSkirt_",
+    mesh_name="Mesh",
+    closed_loop=True,
+):
+    _delete_proxy_objects(prefix, mesh_name)
+    collection = get_or_create_collection(_proxy_collection_name(prefix, mesh_name))
+    proxy_samples = _uniform_proxy_row_samples(samples)
+    rows = len(proxy_samples)
+    columns = len(proxy_samples[0]) if rows else 0
+    if rows < 2 or columns < 2:
+        return None
+
+    verts = [
+        tuple(proxy_samples[row][column])
+        for row in range(rows)
+        for column in range(columns)
+    ]
+    faces = []
+    column_limit = columns if closed_loop else columns - 1
+    for row in range(rows - 1):
+        for column in range(column_limit):
+            next_column = (column + 1) % columns
+            if not closed_loop and next_column <= column:
+                continue
+            faces.append((
+                row * columns + column,
+                row * columns + next_column,
+                (row + 1) * columns + next_column,
+                (row + 1) * columns + column,
+            ))
+
+    mesh_data = bpy.data.meshes.new(f"{prefix}PROXY_{mesh_name}_Mesh")
+    mesh_data.from_pydata(verts, [], faces)
+    mesh_data.update()
+    obj = bpy.data.objects.new(f"{prefix}PROXY_{mesh_name}", mesh_data)
+    collection.objects.link(obj)
+    obj.display_type = 'WIRE'
+    obj.show_wire = True
+    obj.show_in_front = True
+    obj.hide_render = True
+    obj[PROP_TARGET] = mesh_name
+    obj[PROP_KIND] = PROP_PROXY_KIND
+    return obj
+
+
+def apply_proxy_mesh_weights(
+    proxy_obj,
+    armature_obj,
+    control_points,
+    rows,
+    columns,
+    prefix,
+    parent_bone_name,
+    settings,
+):
+    """Give the generated proxy the same cage-based bone weights as the target."""
+    if proxy_obj is None or proxy_obj.type != 'MESH':
+        return 0
+
+    indices = list(range(len(proxy_obj.data.vertices)))
+    weights = {}
+    matrix_world = proxy_obj.matrix_world
+    for index in indices:
+        vertex_world = matrix_world @ proxy_obj.data.vertices[index].co
+        h, u = compute_vertex_cage_parameters(
+            vertex_world,
+            control_points,
+            True,
+        )
+        weights[index] = compute_vertex_weights(
+            vertex_world,
+            h,
+            u,
+            rows,
+            columns,
+            prefix,
+            settings,
+        )
+
+    assignments = apply_weights(
+        proxy_obj,
+        indices,
+        weights,
+        prefix,
+        parent_bone_name,
+        True,
+        settings.top_blend_to_parent,
+    )
+    _ensure_armature_modifier(proxy_obj, armature_obj)
+    return assignments
+
+
+# ---------------------------------------------------------------------------
+# Build validation and orchestration
+# ---------------------------------------------------------------------------
+
+
+def _records_from_indices(mesh_obj, indices):
+    """Read current point-cloud positions and world normals without mode changes."""
+    records = []
+    matrix_world = mesh_obj.matrix_world
+    normal_matrix = matrix_world.to_3x3().inverted_safe().transposed()
+    if mesh_obj.mode == 'EDIT':
+        bm = bmesh.from_edit_mesh(mesh_obj.data)
+        bm.verts.index_update()
+        bm.verts.ensure_lookup_table()
+        bm.normal_update()
+        for index in indices:
+            if 0 <= index < len(bm.verts):
+                vertex = bm.verts[index]
+                local = vertex.co.copy()
+                records.append({
+                    "index": index,
+                    "local": local,
+                    "world": matrix_world @ local,
+                    "normal": _safe_normalized(
+                        normal_matrix @ vertex.normal,
+                        Vector((0.0, 0.0, 1.0)),
+                    ),
+                })
+    else:
+        for index in indices:
+            if 0 <= index < len(mesh_obj.data.vertices):
+                vertex = mesh_obj.data.vertices[index]
+                local = vertex.co.copy()
+                records.append({
+                    "index": index,
+                    "local": local,
+                    "world": matrix_world @ local,
+                    "normal": _safe_normalized(
+                        normal_matrix @ vertex.normal,
+                        Vector((0.0, 0.0, 1.0)),
+                    ),
+                })
+    return records
+
+
+def _validate_build(context, settings, require_selection):
+    _validate_prefix(settings.prefix)
+    mesh_objects = _resolve_target_meshes(context, settings)
+    armature = settings.target_armature
+    if not mesh_objects:
+        raise ValueError("Target Mesh does not exist.")
+    if armature is None or armature.type != 'ARMATURE':
+        raise ValueError("Target Armature does not exist.")
+    for mesh_obj in mesh_objects:
+        if not _scene_has_object(context, mesh_obj):
+            raise ValueError(f"Target Mesh '{mesh_obj.name}' is not in this View Layer.")
+    if not _scene_has_object(context, armature):
+        raise ValueError("Target Armature is not in this View Layer.")
+    if settings.rows < 2:
+        raise ValueError("Rows must be at least 2.")
+    if settings.columns < 4:
+        raise ValueError("Columns must be at least 4.")
+    if not settings.parent_bone:
+        raise ValueError("A Parent Bone is required.")
+    if settings.parent_bone.startswith(settings.prefix):
+        raise ValueError("Parent Bone cannot use the generated prefix.")
+    if armature.data.bones.get(settings.parent_bone) is None:
+        raise ValueError("Parent Bone does not exist in the Target Armature.")
+
+    primary_mesh = mesh_objects[0]
+    collection_name = str(
+        primary_mesh.get(
+            PROP_COLLECTION,
+            _control_collection_name(settings.prefix, primary_mesh.name),
+        )
+    )
+    collection = bpy.data.collections.get(collection_name)
+    if collection is None:
+        raise ValueError("Control Collection does not exist; generate controls first.")
+    controls = find_control_points(collection, settings.prefix, require_all=True)
+
+    selection_items = []
+    if require_selection:
+        for mesh_obj in mesh_objects:
+            indices = _current_or_stored_indices(mesh_obj)
+            if not indices:
+                raise ValueError(
+                    f"Target Mesh '{mesh_obj.name}' has no recorded selected vertices."
+                )
+            selection_items.append((mesh_obj, indices))
+    return primary_mesh, mesh_objects, armature, controls, selection_items
+
+
+def _required_bones_exist(armature, prefix, rows, columns):
+    missing = [
+        _bone_name(prefix, column, row)
+        for column in range(columns)
+        for row in range(rows)
+        if armature.data.bones.get(_bone_name(prefix, column, row)) is None
+    ]
+    if missing:
+        raise ValueError(
+            "缺少用于赋权的生成骨骼，请先 Only Build Bones："
+            + ", ".join(missing[:4])
+        )
+
+
+def _build(context, settings, build_bones, build_weights):
+    primary_mesh, mesh_objects, armature, control_objects, selection_items = (
+        _validate_build(context, settings, require_selection=True)
+    )
+    control_points = _control_world_locations(control_objects)
+    surface_records = []
+    for mesh_obj, selected_indices in selection_items:
+        surface_records.extend(_records_from_indices(mesh_obj, selected_indices))
+    if len(surface_records) < 4:
+        raise ValueError("At least four valid selected vertices are required.")
+    surface_points = [record["world"] for record in surface_records]
+    surface_normals = [record["normal"] for record in surface_records]
+    samples, _fitted_sample_normals = build_cage_samples(
+        control_points,
+        settings.rows,
+        settings.columns,
+        settings.bone_inset,
+        settings.closed_loop,
+        surface_points=surface_points,
+        surface_normals=surface_normals,
+        slice_thickness=settings.slice_thickness,
+        fit_mode=settings.fit_mode,
+        ring_fit_strength=settings.ring_fit_strength,
+        longitudinal_smoothing=settings.longitudinal_smoothing,
+        return_normals=True,
+    )
+    _configure_lr_suffix_naming(samples, settings.use_lr_suffix_names)
+    # The proxy grid is the roll reference. Bone local +Z must point opposite
+    # to its corresponding proxy vertex normal, including at low column counts.
+    proxy_samples = _uniform_proxy_row_samples(samples)
+    proxy_vertex_normals = _proxy_grid_vertex_normals(
+        proxy_samples,
+        settings.closed_loop,
+    )
+    bone_z_axes = [
+        [-normal for normal in row_normals]
+        for row_normals in proxy_vertex_normals
+    ]
+
+    state = _ContextState(context)
+    created_bones = 0
+    assignments = 0
+    modifier_added = False
+    try:
+        if build_bones:
+            _activate_object(context, armature, mode='EDIT')
+            if settings.clear_existing_generated_bones:
+                cleanup_generated_bones(armature, settings.prefix)
+            created = create_bones_from_samples(
+                armature,
+                samples,
+                settings.parent_bone,
+                settings.prefix,
+                False,
+                settings.closed_loop,
+                sample_normals=bone_z_axes,
+                bone_collection_name=settings.bone_collection,
+            )
+            created_bones = len(created)
+            bpy.ops.object.mode_set(mode='OBJECT')
+
+            _delete_debug_objects(settings.prefix, primary_mesh.name)
+            _delete_proxy_objects(settings.prefix, primary_mesh.name)
+            if settings.create_proxy_mesh:
+                proxy_obj = create_proxy_mesh(
+                    samples,
+                    settings.prefix,
+                    primary_mesh.name,
+                    settings.closed_loop,
+                )
+                apply_proxy_mesh_weights(
+                    proxy_obj,
+                    armature,
+                    control_points,
+                    settings.rows,
+                    settings.columns,
+                    settings.prefix,
+                    settings.parent_bone,
+                    settings,
+                )
+            if settings.create_debug_curves:
+                create_debug_curves(
+                    samples,
+                    settings.prefix,
+                    primary_mesh.name,
+                    settings.closed_loop,
+                )
+
+        if build_weights:
+            _required_bones_exist(
+                armature, settings.prefix, settings.rows, settings.columns
+            )
+            for mesh_obj, selected_indices in selection_items:
+                _activate_object(context, mesh_obj, mode='OBJECT')
+                all_weights = {}
+                matrix_world = mesh_obj.matrix_world
+                for index in selected_indices:
+                    vertex_world = matrix_world @ mesh_obj.data.vertices[index].co
+                    h, u = compute_vertex_cage_parameters(
+                        vertex_world,
+                        control_points,
+                        settings.closed_loop,
+                    )
+                    all_weights[index] = compute_vertex_weights(
+                        vertex_world,
+                        h,
+                        u,
+                        settings.rows,
+                        settings.columns,
+                        settings.prefix,
+                        settings,
+                    )
+                assignments += apply_weights(
+                    mesh_obj,
+                    selected_indices,
+                    all_weights,
+                    settings.prefix,
+                    settings.parent_bone,
+                    settings.clear_existing_generated_vertex_groups,
+                    settings.top_blend_to_parent,
+                )
+                _modifier, added = _ensure_armature_modifier(mesh_obj, armature)
+                modifier_added |= added
+
+        collection_name = str(
+            primary_mesh.get(
+                PROP_COLLECTION,
+                _control_collection_name(settings.prefix, primary_mesh.name),
+            )
+        )
+        for mesh_obj in mesh_objects:
+            _store_mesh_metadata(
+                mesh_obj,
+                settings,
+                collection_name,
+                mesh_objects,
+            )
+    finally:
+        state.restore(context)
+
+    return {
+        "bones": created_bones,
+        "vertices": sum(len(indices) for _mesh, indices in selection_items)
+        if build_weights else 0,
+        "assignments": assignments,
+        "modifier_added": modifier_added,
+    }
+
+
+def _delete_generated_bones_and_groups(context, settings):
+    mesh_objects = _resolve_target_meshes(context, settings)
+    armature = settings.target_armature
+    _validate_prefix(settings.prefix)
+    if not mesh_objects:
+        raise ValueError("Target Mesh does not exist.")
+    if armature is None or armature.type != 'ARMATURE':
+        raise ValueError("Target Armature does not exist.")
+
+    state = _ContextState(context)
+    removed_bones = 0
+    removed_groups = 0
+    try:
+        _activate_object(context, armature, mode='EDIT')
+        removed_bones = cleanup_generated_bones(armature, settings.prefix)
+        bpy.ops.object.mode_set(mode='OBJECT')
+
+        for mesh_obj in mesh_objects:
+            _activate_object(context, mesh_obj, mode='OBJECT')
+            for group in list(mesh_obj.vertex_groups):
+                if group.name.startswith(settings.prefix):
+                    mesh_obj.vertex_groups.remove(group)
+                    removed_groups += 1
+            _delete_debug_objects(settings.prefix, mesh_obj.name)
+            _delete_proxy_objects(settings.prefix, mesh_obj.name)
+    finally:
+        state.restore(context)
+    return removed_bones, removed_groups
+
+
+# ---------------------------------------------------------------------------
+# Operators
+# ---------------------------------------------------------------------------
+
+
+class AUTOSKIRT_OT_generate_control_points(bpy.types.Operator):
+    bl_idname = "auto_skirt.generate_control_points"
+    bl_label = "生成控制点"
+    bl_description = "根据编辑模式中选中的顶点生成 16 个可编辑控制点"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        settings = context.scene.auto_skirt_settings
+        try:
+            collection, count = generate_control_points(context, settings)
+            _enter_control_edit_mode(context, settings, collection)
+        except (ValueError, RuntimeError) as exc:
+            self.report({'ERROR'}, str(exc))
             return {'CANCELLED'}
-
-        # 10) 退出编辑模式，创建骨架
-        bpy.ops.object.mode_set(mode='OBJECT')
-
-        arm_data = bpy.data.armatures.new(f"{props.name_prefix}")
-        arm_obj = bpy.data.objects.new(
-            f"{props.name_prefix}", arm_data)
-        context.collection.objects.link(arm_obj)
-        context.view_layer.objects.active = arm_obj
-        arm_obj.select_set(True)
-
-        bpy.ops.object.mode_set(mode='EDIT')
-
-        # 11) 生成骨骼
-        created = 0
-        for label, coords, side in labeled_chains:
-            parent_bone = None
-
-            centers = loop_centers
-            if side == "R":
-                centers = [Vector((-c.x, c.y, c.z)) for c in loop_centers]
-
-            for seg in range(num_segments):
-                head_pos = coords[seg]
-                tail_pos = coords[seg + 1]
-
-                name = _bone_name(props.name_prefix, label, seg, side)
-                bone = arm_data.edit_bones.new(name)
-                bone.head = head_pos
-                bone.tail = tail_pos
-
-                if bone.length < 1e-5:
-                    bone.tail = bone.head.copy()
-                    bone.tail.z -= 0.02
-
-                # Z轴从环中心向外发散
-                outward = head_pos - centers[seg]
-                if outward.length > 1e-6:
-                    bone.align_roll(outward)
-
-                if parent_bone:
-                    bone.parent = parent_bone
-                    bone.use_connect = True
-
-                parent_bone = bone
-                created += 1
-
-        bpy.ops.object.mode_set(mode='OBJECT')
-
-        total_with_mirror = len(labeled_chains)
-        info = (f"{total_labels} 条链(含镜像 {total_with_mirror} 条)"
-                f" × {num_segments} 段 = {created} 根骨骼")
-        self.report({'INFO'}, f"生成完成: {info}")
-        props.last_info = info
+        self.report(
+            {'INFO'},
+            f"已从 {count} 个顶点生成 16 个控制点，并进入控制点编辑：{collection.name}",
+        )
         return {'FINISHED'}
 
 
-# ===================== 属性 =====================
+class AUTOSKIRT_OT_refit_control_points(bpy.types.Operator):
+    bl_idname = "auto_skirt.refit_control_points"
+    bl_label = "按选区重新拟合控制点"
+    bl_description = "将现有 16 个控制点重新拟合到当前编辑模式选区"
+    bl_options = {'REGISTER', 'UNDO'}
 
-class SkirtBoneProperties(bpy.types.PropertyGroup):
-    name_prefix: StringProperty(
-        name="命名前缀",
-        default="skirt",
-        description="骨骼命名前缀，如 skirt → skirt.a.001",
+    def execute(self, context):
+        settings = context.scene.auto_skirt_settings
+        try:
+            count = _refit_control_points(context, settings)
+        except (ValueError, RuntimeError) as exc:
+            self.report({'ERROR'}, str(exc))
+            return {'CANCELLED'}
+        self.report({'INFO'}, f"已按 {count} 个选中顶点重新拟合控制点")
+        return {'FINISHED'}
+
+
+class AUTOSKIRT_OT_edit_control_points(bpy.types.Operator):
+    bl_idname = "auto_skirt.edit_control_points"
+    bl_label = "修改控制点"
+    bl_description = "解锁已有控制点并进入控制点编辑界面"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        settings = context.scene.auto_skirt_settings
+        try:
+            _enter_control_edit_mode(context, settings)
+        except (ValueError, RuntimeError) as exc:
+            self.report({'ERROR'}, str(exc))
+            return {'CANCELLED'}
+        self.report({'INFO'}, "已进入控制点编辑；完成、取消和复原在 3D 视图顶部")
+        return {'FINISHED'}
+
+
+class AUTOSKIRT_OT_finish_control_edit(bpy.types.Operator):
+    bl_idname = "auto_skirt.finish_control_edit"
+    bl_label = "完成控制点编辑"
+    bl_description = "锁定当前控制点位置，只能再次通过面板修改"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        settings = context.scene.auto_skirt_settings
+        if not settings.control_edit_active:
+            self.report({'INFO'}, "当前不在控制点编辑状态")
+            return {'CANCELLED'}
+        _apply_control_edit_mirror(context)
+        _leave_control_edit_mode(context, settings, reset=False)
+        self.report({'INFO'}, "控制点已固定")
+        return {'FINISHED'}
+
+
+class AUTOSKIRT_OT_cancel_control_edit(bpy.types.Operator):
+    bl_idname = "auto_skirt.cancel_control_edit"
+    bl_label = "取消控制点编辑"
+    bl_description = "放弃本次控制点移动并锁定控制点"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        settings = context.scene.auto_skirt_settings
+        if not settings.control_edit_active:
+            self.report({'INFO'}, "当前不在控制点编辑状态")
+            return {'CANCELLED'}
+        _leave_control_edit_mode(context, settings, reset=True)
+        self.report({'INFO'}, "已取消并恢复到进入编辑前的位置")
+        return {'FINISHED'}
+
+
+class AUTOSKIRT_OT_reset_control_edit(bpy.types.Operator):
+    bl_idname = "auto_skirt.reset_control_edit"
+    bl_label = "复原控制点"
+    bl_description = "复原到进入本次控制点编辑时的位置，但继续编辑"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        settings = context.scene.auto_skirt_settings
+        if not settings.control_edit_active:
+            self.report({'INFO'}, "当前不在控制点编辑状态")
+            return {'CANCELLED'}
+        try:
+            _mesh_obj, _collection, controls = _control_edit_collection(context, settings)
+        except (ValueError, RuntimeError) as exc:
+            self.report({'ERROR'}, str(exc))
+            return {'CANCELLED'}
+        _restore_control_positions(controls, settings.control_edit_snapshot)
+        settings.control_edit_last_positions = _json_position_map(controls)
+        _select_only_controls(context, controls)
+        self.report({'INFO'}, "控制点已复原")
+        return {'FINISHED'}
+
+
+class AUTOSKIRT_OT_build(bpy.types.Operator):
+    bl_idname = "auto_skirt.build"
+    bl_label = "生成自动裙骨"
+    bl_description = "生成骨骼、投影权重，或同时生成两者"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    action: EnumProperty(
+        name="操作",
+        items=(
+            ('BOTH', "骨骼和权重", "生成骨骼并应用权重"),
+            ('BONES', "仅生成骨骼", "只生成骨骼"),
+            ('WEIGHTS', "仅应用权重", "只应用权重"),
+        ),
+        default='BOTH',
+        options={'HIDDEN'},
     )
-    bone_count: IntProperty(
-        name="L侧骨骼链数量(不包含中轴)",
-        default=5,
-        min=1,
-        description="前后中轴之间L侧(+x方向)生成的骨骼链数量（R侧自动镜像同等数量）",
+
+    def execute(self, context):
+        settings = context.scene.auto_skirt_settings
+        build_bones = self.action in {'BOTH', 'BONES'}
+        build_weights = self.action in {'BOTH', 'WEIGHTS'}
+        try:
+            if settings.control_edit_active:
+                _apply_control_edit_mirror(context)
+                _leave_control_edit_mode(context, settings, reset=False)
+            _force_fixed_weight_defaults(settings)
+            result = _build(context, settings, build_bones, build_weights)
+        except (ValueError, RuntimeError) as exc:
+            self.report({'ERROR'}, str(exc))
+            return {'CANCELLED'}
+
+        parts = []
+        if build_bones:
+            parts.append(f"骨骼 {result['bones']} 根")
+        if build_weights:
+            parts.append(
+                f"顶点 {result['vertices']} 个 / 权重写入 {result['assignments']} 次"
+            )
+            if result["modifier_added"]:
+                parts.append("已添加 Armature Modifier")
+        self.report({'INFO'}, "；".join(parts))
+        return {'FINISHED'}
+
+
+class AUTOSKIRT_OT_delete_controls(bpy.types.Operator):
+    bl_idname = "auto_skirt.delete_controls"
+    bl_label = "删除生成的控制点"
+    bl_description = "仅删除本插件标记且前缀匹配的控制点"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        settings = context.scene.auto_skirt_settings
+        if settings.control_edit_active:
+            _leave_control_edit_mode(context, settings, reset=False)
+
+        mesh_objects = _resolve_target_meshes(context, settings)
+        if not mesh_objects:
+            self.report({'ERROR'}, "Target Mesh does not exist.")
+            return {'CANCELLED'}
+        primary_mesh = mesh_objects[0]
+        try:
+            _validate_prefix(settings.prefix)
+            prefixes = {
+                settings.prefix,
+                str(primary_mesh.get(PROP_PREFIX, settings.prefix)),
+            }
+            removed = sum(
+                delete_generated_controls(prefix, primary_mesh.name)
+                for prefix in prefixes
+            )
+        except (ValueError, RuntimeError) as exc:
+            self.report({'ERROR'}, str(exc))
+            return {'CANCELLED'}
+        for mesh_obj in mesh_objects:
+            if PROP_COLLECTION in mesh_obj:
+                del mesh_obj[PROP_COLLECTION]
+            if PROP_TARGETS in mesh_obj:
+                del mesh_obj[PROP_TARGETS]
+
+        self.report({'INFO'}, f"已删除 {removed} 个生成控制点")
+        return {'FINISHED'}
+
+
+class AUTOSKIRT_OT_delete_bones_groups(bpy.types.Operator):
+    bl_idname = "auto_skirt.delete_bones_groups"
+    bl_label = "删除生成的骨骼和顶点组"
+    bl_description = "删除前缀匹配的生成骨骼、顶点组和调试曲线"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        settings = context.scene.auto_skirt_settings
+        try:
+            bones, groups = _delete_generated_bones_and_groups(context, settings)
+        except (ValueError, RuntimeError) as exc:
+            self.report({'ERROR'}, str(exc))
+            return {'CANCELLED'}
+        self.report({'INFO'}, f"已删除 {bones} 根骨骼和 {groups} 个顶点组")
+        return {'FINISHED'}
+
+
+# ---------------------------------------------------------------------------
+# Properties and UI
+# ---------------------------------------------------------------------------
+
+
+class AUTOSKIRT_PG_settings(bpy.types.PropertyGroup):
+    # Internal primary mesh of the current multi-mesh edit session.  It is
+    # recorded automatically and intentionally has no user-facing selector.
+    target_mesh: PointerProperty(
+        type=bpy.types.Object,
+        poll=_poll_mesh,
+        options={'HIDDEN'},
     )
-    front_axis_vert_index: IntProperty(
-        name="前中轴顶点索引",
-        default=-1,
+    target_armature: PointerProperty(
+        name="目标骨架",
+        type=bpy.types.Object,
+        poll=_poll_armature,
     )
-    back_axis_vert_index: IntProperty(
-        name="后中轴顶点索引",
-        default=-1,
-    )
-    last_info: StringProperty(
-        name="上次生成信息",
+    parent_bone: StringProperty(
+        name="父骨骼",
         default="",
+        description="第一层裙骨的父骨骼，同时用于顶部混合顶点组",
+    )
+    bone_collection: StringProperty(
+        name="骨骼集合",
+        default="Skirt Bones",
+        description="输入已有骨骼集合名称以使用它；不存在时会自动新建",
+    )
+    prefix: StringProperty(
+        name="命名前缀",
+        default="AutoSkirt_",
+    )
+    use_lr_suffix_names: BoolProperty(
+        name="左右后缀 (.L/.R)",
+        default=False,
+        description="开启后按世界原点 X=0 自动配对左右列；负 X 使用 .L，正 X 使用 .R",
+    )
+    rows: IntProperty(
+        name="纵向层数",
+        default=6,
+        min=2,
+        max=128,
+    )
+    columns: IntProperty(
+        name="骨骼链数",
+        default=12,
+        min=4,
+        max=256,
+    )
+    control_levels: IntProperty(
+        name="控制层数",
+        default=4,
+        min=4,
+        max=4,
+    )
+    closed_loop: BoolProperty(
+        name="闭合环",
+        default=True,
+        description="闭合 Left 到 Front；关闭时生成 Front→Right→Back→Left 开放链",
+        options={'HIDDEN'},
+    )
+    bone_inset: FloatProperty(
+        name="骨骼内缩",
+        default=0.05,
+        min=0.0,
+        max=0.95,
+        subtype='FACTOR',
+    )
+    slice_thickness: FloatProperty(
+        name="切片厚度",
+        default=0.08,
+        min=0.001,
+        max=0.5,
+        subtype='FACTOR',
+        description="按归一化高度选取每层点云的初始半厚度",
+    )
+    fit_mode: EnumProperty(
+        name="骨骼环拟合模式",
+        items=(
+            ('OUTER_ENVELOPE', "外轮廓", "取当前方向最外层候选点，适合多层裙和大衣"),
+            ('WEIGHTED_AVERAGE', "加权平均", "对方向和高度匹配的候选点加权平均"),
+            ('MEDIAN', "中位数", "使用有效候选点的中位半径"),
+        ),
+        default='OUTER_ENVELOPE',
+    )
+    ring_fit_strength: FloatProperty(
+        name="骨骼环拟合强度",
+        default=1.0,
+        min=0.0,
+        max=1.0,
+        subtype='FACTOR',
+        description="0 保持在控制笼内边界，1 完全贴合点云计算结果",
+    )
+    longitudinal_smoothing: BoolProperty(
+        name="纵向轻度平滑",
+        default=True,
+        description="对中间层做 0.2/0.6/0.2 平滑，顶底层不变",
+    )
+    top_blend_to_parent: BoolProperty(
+        name="顶部混合到父骨骼",
+        default=True,
+    )
+    top_blend_height: FloatProperty(
+        name="顶部混合高度",
+        default=0.15,
+        min=0.001,
+        max=1.0,
+        subtype='FACTOR',
+    )
+    weight_curve: EnumProperty(
+        name="权重曲线",
+        items=(
+            ('LINEAR', "线性", "层间使用线性插值"),
+            ('COSINE', "余弦", "层间使用余弦平滑插值"),
+            ('SHARP', "锐利", "层间使用更集中的双曲正切插值"),
+        ),
+        default='COSINE',
+    )
+    max_influences: IntProperty(
+        name="最大影响数",
+        default=4,
+        min=1,
+        max=16,
+        description="启用顶部混合时，父骨骼始终保留一个影响名额",
+    )
+    normalize_weights: BoolProperty(
+        name="权重归一化",
+        default=True,
+    )
+    clear_existing_generated_bones: BoolProperty(
+        name="清除已有生成骨骼",
+        default=True,
+    )
+    clear_existing_generated_vertex_groups: BoolProperty(
+        name="清除已有生成顶点组",
+        default=True,
+    )
+    create_debug_curves: BoolProperty(
+        name="创建调试曲线",
+        default=False,
+    )
+    create_proxy_mesh: BoolProperty(
+        name="生成代理网格",
+        default=False,
+        description="按当前骨骼环采样生成一个只用于检查形状的代理网格",
+    )
+    control_edit_active: BoolProperty(
+        name="正在编辑控制点",
+        default=False,
+        options={'HIDDEN'},
+    )
+    control_mirror_x: BoolProperty(
+        name="X 镜像",
+        default=False,
+        description="左右控制点沿全局 X 对称编辑",
+    )
+    control_mirror_y: BoolProperty(
+        name="Y 镜像",
+        default=False,
+        description="前后控制点沿全局 Y 对称编辑",
+    )
+    control_edit_snapshot: StringProperty(
+        name="控制点编辑快照",
+        default="",
+        options={'HIDDEN'},
+    )
+    control_edit_last_positions: StringProperty(
+        name="控制点编辑上一帧位置",
+        default="",
+        options={'HIDDEN'},
+    )
+    control_edit_hide_select_state: StringProperty(
+        name="控制点编辑选择锁定状态",
+        default="",
+        options={'HIDDEN'},
+    )
+    control_edit_mesh_name: StringProperty(
+        name="控制点编辑目标网格",
+        default="",
+        options={'HIDDEN'},
     )
 
 
-# ===================== 面板 =====================
-
-class SKIRT_PT_Panel(bpy.types.Panel):
+class AUTOSKIRT_PT_main(bpy.types.Panel):
     bl_label = "裙子骨骼生成器"
-    bl_idname = "SKIRT_PT_Panel"
+    bl_idname = "AUTOSKIRT_PT_main"
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
-    bl_category = "裙子骨骼"
+    bl_category = "自动裙骨"
 
     def draw(self, context):
         layout = self.layout
-        props = context.scene.skirt_bone_props
+        settings = context.scene.auto_skirt_settings
 
-        box = layout.box()
-        box.label(text="命名", icon='FONT_DATA')
-        box.prop(props, "name_prefix")
+        layout.use_property_split = True
+        layout.use_property_decorate = False
 
-        # 中轴标记
-        box_axis = layout.box()
-        box_axis.label(text="中轴标记", icon='ORIENTATION_NORMAL')
-        row_f = box_axis.row(align=True)
-        row_f.operator("skirt.mark_front_axis", icon='TRACKING_FORWARDS',
-                       text="标记前中轴")
-        if props.front_axis_vert_index >= 0:
-            row_f.label(text=f"✓ 顶点 {props.front_axis_vert_index}")
+        target_box = layout.box()
+        target_box.label(text="当前编辑网格")
+        target_box.label(
+            text="在 Edit Mode 中选中一个或多个网格及其顶点",
+            icon='INFO',
+        )
+        target_box.prop(settings, "target_armature")
+        if settings.target_armature is not None:
+            target_box.prop_search(
+                settings,
+                "parent_bone",
+                settings.target_armature.data,
+                "bones",
+            )
         else:
-            row_f.label(text="未标记")
-        row_b = box_axis.row(align=True)
-        row_b.operator("skirt.mark_back_axis", icon='TRACKING_BACKWARDS',
-                       text="标记后中轴")
-        if props.back_axis_vert_index >= 0:
-            row_b.label(text=f"✓ 顶点 {props.back_axis_vert_index}")
-        else:
-            row_b.label(text="未标记")
+            target_box.prop(settings, "parent_bone")
+        # A plain text field is intentional: prop_search rejects names that
+        # do not already exist, while this value may name a new collection.
+        target_box.prop(settings, "bone_collection")
 
-        # 骨骼分布
-        box2 = layout.box()
-        box2.label(text="骨骼分布", icon='MOD_ARRAY')
-        box2.prop(props, "bone_count")
+        option_box = layout.box()
+        option_box.label(text="生成选项")
+        option_box.prop(settings, "prefix")
+        option_box.prop(settings, "use_lr_suffix_names")
+        option_box.prop(settings, "rows")
+        option_box.prop(settings, "columns")
+        option_box.prop(settings, "create_proxy_mesh")
+
+        if settings.control_edit_active:
+            edit_box = layout.box()
+            edit_box.label(text="正在编辑控制点", icon='EMPTY_AXIS')
+            edit_box.label(text="完成 / 取消 / 复原在 3D 视图顶部")
+            edit_box.prop(settings, "control_mirror_x", text="X 镜像")
+            edit_box.prop(settings, "control_mirror_y", text="Y 镜像")
 
         layout.separator()
-
-        row = layout.row()
-        row.scale_y = 1.6
-        row.operator("skirt.generate_bones", icon='BONE_DATA',
-                     text="⚡ 生成裙子骨骼")
-
-        if props.last_info:
-            box3 = layout.box()
-            box3.label(text="上次生成结果:", icon='CHECKMARK')
-            box3.label(text=props.last_info)
+        layout.operator(
+            AUTOSKIRT_OT_generate_control_points.bl_idname,
+            text="生成控制点并编辑",
+            icon='EMPTY_AXIS',
+        )
+        layout.operator(
+            AUTOSKIRT_OT_edit_control_points.bl_idname,
+            text="修改控制点",
+            icon='GREASEPENCIL',
+        )
 
         layout.separator()
-        layout.label(text="使用方法:", icon='INFO')
-        col = layout.column(align=True)
-        col.label(text="1. 进入裙子网格编辑模式")
-        col.label(text="2. 选顶点标记前/后中轴")
-        col.label(text="3. 环选多条水平边")
-        col.label(text="4. 设置参数后点击生成")
+        operator = layout.operator(
+            AUTOSKIRT_OT_build.bl_idname,
+            text="生成骨骼和权重",
+            icon='ARMATURE_DATA',
+        )
+        operator.action = 'BOTH'
 
-
-# ===================== 注册 =====================
+        layout.separator()
+        maintenance = layout.row(align=True)
+        maintenance.operator(
+            AUTOSKIRT_OT_delete_controls.bl_idname,
+            text="删控制点",
+            icon='TRASH',
+        )
+        maintenance.operator(
+            AUTOSKIRT_OT_delete_bones_groups.bl_idname,
+            text="删生成项",
+            icon='TRASH',
+        )
 
 classes = (
-    SkirtBoneProperties,
-    SKIRT_OT_MarkFrontAxis,
-    SKIRT_OT_MarkBackAxis,
-    SKIRT_OT_GenerateBones,
-    SKIRT_PT_Panel,
+    AUTOSKIRT_PG_settings,
+    AUTOSKIRT_OT_generate_control_points,
+    AUTOSKIRT_OT_refit_control_points,
+    AUTOSKIRT_OT_edit_control_points,
+    AUTOSKIRT_OT_finish_control_edit,
+    AUTOSKIRT_OT_cancel_control_edit,
+    AUTOSKIRT_OT_reset_control_edit,
+    AUTOSKIRT_OT_build,
+    AUTOSKIRT_OT_delete_controls,
+    AUTOSKIRT_OT_delete_bones_groups,
+    AUTOSKIRT_PT_main,
 )
 
 
 def register():
     for cls in classes:
         bpy.utils.register_class(cls)
-    bpy.types.Scene.skirt_bone_props = PointerProperty(type=SkirtBoneProperties)
+    bpy.types.Scene.auto_skirt_settings = PointerProperty(
+        type=AUTOSKIRT_PG_settings
+    )
+    try:
+        bpy.types.VIEW3D_HT_header.remove(_draw_control_edit_header)
+    except Exception:
+        pass
+    bpy.types.VIEW3D_HT_header.append(_draw_control_edit_header)
+    _install_selection_marker_draw_handler()
+    if _auto_skirt_depsgraph_update not in bpy.app.handlers.depsgraph_update_post:
+        bpy.app.handlers.depsgraph_update_post.append(_auto_skirt_depsgraph_update)
 
 
 def unregister():
-    del bpy.types.Scene.skirt_bone_props
+    _remove_selection_marker_draw_handler()
+    if _auto_skirt_depsgraph_update in bpy.app.handlers.depsgraph_update_post:
+        bpy.app.handlers.depsgraph_update_post.remove(_auto_skirt_depsgraph_update)
+    try:
+        bpy.types.VIEW3D_HT_header.remove(_draw_control_edit_header)
+    except Exception:
+        pass
+    if hasattr(bpy.types.Scene, "auto_skirt_settings"):
+        del bpy.types.Scene.auto_skirt_settings
     for cls in reversed(classes):
         bpy.utils.unregister_class(cls)
 
