@@ -4,7 +4,7 @@
 bl_info = {
     "name": "裙子骨骼生成器",
     "author": "Akazure",
-    "version": (1, 0, 0),
+    "version": (1, 2, 0),
     "blender": (4, 5, 0),
     "location": "3D 视图 > 右侧边栏 > 自动裙骨",
     "description": "根据控制点生成裙子骨骼",
@@ -13,6 +13,8 @@ bl_info = {
 
 import json
 import math
+
+from . import sheet_generator
 
 import bmesh
 import bpy
@@ -3372,9 +3374,11 @@ def register():
     _install_selection_marker_draw_handler()
     if _auto_skirt_depsgraph_update not in bpy.app.handlers.depsgraph_update_post:
         bpy.app.handlers.depsgraph_update_post.append(_auto_skirt_depsgraph_update)
+    sheet_generator.register()
 
 
 def unregister():
+    sheet_generator.unregister()
     _remove_selection_marker_draw_handler()
     if _auto_skirt_depsgraph_update in bpy.app.handlers.depsgraph_update_post:
         bpy.app.handlers.depsgraph_update_post.remove(_auto_skirt_depsgraph_update)
