@@ -4,7 +4,7 @@
 bl_info = {
     "name": "裙子骨骼生成器",
     "author": "Akazure",
-    "version": (1, 2, 0),
+    "version": (1, 3, 0),
     "blender": (4, 5, 0),
     "location": "3D 视图 > 右侧边栏 > 自动裙骨",
     "description": "根据控制点生成裙子骨骼",
@@ -30,6 +30,7 @@ from bpy.props import (
     StringProperty,
 )
 from mathutils import Vector
+from mathutils.bvhtree import BVHTree
 
 
 CONTROL_DIRECTIONS = ("Front", "Right", "Back", "Left")
@@ -50,6 +51,8 @@ PROP_RECORDS = "auto_skirt_selection_records"
 PROP_TARGET = "auto_skirt_target_mesh"
 PROP_TARGETS = "auto_skirt_target_meshes"
 PROP_KIND = "auto_skirt_generated_kind"
+PROP_SHAPE_MODE = "auto_skirt_shape_mode"
+PROP_ASYM_BASE_L3 = "auto_skirt_asym_base_l3"
 
 PROP_PROXY_KIND = "PROXY"
 EDIT_KIND_CONTROL = "CONTROL"
@@ -413,6 +416,38 @@ def _current_or_stored_indices(mesh_obj):
     return _load_selected_indices(mesh_obj)
 
 
+def _store_asym_base_l3(mesh_obj, controls):
+    data = {
+        direction: [
+            float(controls[direction][-1].x),
+            float(controls[direction][-1].y),
+            float(controls[direction][-1].z),
+        ]
+        for direction in CONTROL_DIRECTIONS
+    }
+    mesh_obj[PROP_ASYM_BASE_L3] = json.dumps(data, separators=(",", ":"))
+
+
+def _load_asym_base_l3(mesh_obj):
+    raw = mesh_obj.get(PROP_ASYM_BASE_L3, "")
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw)
+    except (TypeError, json.JSONDecodeError):
+        return {}
+    result = {}
+    for direction in CONTROL_DIRECTIONS:
+        value = data.get(direction)
+        if isinstance(value, list) and len(value) == 3:
+            try:
+                result[direction] = Vector((
+                    float(value[0]), float(value[1]), float(value[2]),
+                ))
+            except (TypeError, ValueError):
+                pass
+    return result
+
 def _store_mesh_metadata(mesh_obj, settings, collection_name, target_meshes=None):
     mesh_obj[PROP_COLLECTION] = collection_name
     mesh_obj[PROP_ARMATURE] = (
@@ -423,6 +458,7 @@ def _store_mesh_metadata(mesh_obj, settings, collection_name, target_meshes=None
     mesh_obj[PROP_ROWS] = settings.rows
     mesh_obj[PROP_COLUMNS] = settings.columns
     mesh_obj[PROP_BONE_COLLECTION] = settings.bone_collection
+    mesh_obj[PROP_SHAPE_MODE] = settings.skirt_shape_mode
     if target_meshes is not None:
         mesh_obj[PROP_TARGETS] = json.dumps(
             [obj.name for obj in target_meshes if obj is not None and obj.type == 'MESH'],
@@ -1097,6 +1133,228 @@ def _fit_control_positions(records, armature_obj):
     return controls, display_size
 
 
+def _circular_distance(first, second):
+    delta = abs((float(first) - float(second)) % 1.0)
+    return min(delta, 1.0 - delta)
+
+
+def _raw_skirt_u(point, center, right, back):
+    delta = Vector(point) - Vector(center)
+    x = delta.dot(right)
+    y = delta.dot(back)
+    if x * x + y * y <= EPSILON:
+        return 0.0
+    return ((math.atan2(y, x) + math.pi * 0.5) % math.tau) / math.tau
+
+
+def _radial_at_u(raw_u, right, back):
+    theta = -math.pi * 0.5 + math.tau * (float(raw_u) % 1.0)
+    return _safe_normalized(
+        math.cos(theta) * right + math.sin(theta) * back,
+        right,
+    )
+
+
+def _periodic_smooth_values(values, passes=1):
+    result = [float(value) for value in values]
+    if len(result) < 3:
+        return result
+    for _pass in range(max(int(passes), 0)):
+        source = result
+        result = [
+            source[(index - 1) % len(source)] * 0.25
+            + source[index] * 0.5
+            + source[(index + 1) % len(source)] * 0.25
+            for index in range(len(source))
+        ]
+    return result
+
+
+def _fit_smooth_hem_profile(records, armature_obj, sample_count=128):
+    points = [record["world"].copy() for record in records]
+    if len(points) < 4:
+        raise ValueError("至少需要 4 个顶点拟合不对称裙摆")
+
+    up, right, back = _world_axes(armature_obj)
+    heights = [point.dot(up) for point in points]
+    top = max(heights)
+    bottom = min(heights)
+    height_span = top - bottom
+    if height_span <= EPSILON:
+        raise ValueError("选区沿腰口高度轴的范围过小")
+
+    waist_band = max(height_span * 0.10, height_span / 40.0)
+    waist_points = [
+        point for point, height in zip(points, heights)
+        if height >= top - waist_band
+    ]
+    center = _average_points(waist_points or points)
+    center += up * (top - center.dot(up))
+    point_u = [
+        _raw_skirt_u(point, center, right, back)
+        for point in points
+    ]
+
+    sample_count = max(int(sample_count), 32)
+    fitted_heights = []
+    fitted_radii = []
+    base_window = max(2.5 / sample_count, 0.035)
+
+    for sample in range(sample_count):
+        raw_u = sample / sample_count
+        window = base_window
+        candidates = []
+        for _attempt in range(6):
+            candidates = [
+                index for index, value in enumerate(point_u)
+                if _circular_distance(value, raw_u) <= window
+            ]
+            if len(candidates) >= 8:
+                break
+            window = min(window * 1.75, 0.5)
+        if not candidates:
+            candidates = list(range(len(points)))
+
+        candidates.sort(key=lambda index: heights[index])
+        lower_count = max(3, int(math.ceil(len(candidates) * 0.05)))
+        lower = candidates[:min(lower_count, len(candidates))]
+        radial = _radial_at_u(raw_u, right, back)
+
+        weighted_heights = []
+        radial_values = []
+        for index in lower:
+            angular = _circular_distance(point_u[index], raw_u)
+            weight = max(1.0 - angular / max(window, EPSILON), 0.05)
+            axis_point = center + up * (heights[index] - center.dot(up))
+            radius = max((points[index] - axis_point).dot(radial), 0.0)
+            weighted_heights.append((heights[index], weight))
+            radial_values.append((radius, weight))
+
+        height_weight = sum(weight for _value, weight in weighted_heights)
+        fitted_height = (
+            sum(value * weight for value, weight in weighted_heights) / height_weight
+            if height_weight > EPSILON else heights[lower[0]]
+        )
+
+        # Longest selected layer defines the shared envelope. The outer half
+        # suppresses thickness noise while preserving the exterior silhouette.
+        radial_values.sort(key=lambda item: item[0], reverse=True)
+        outer = radial_values[:max(1, int(math.ceil(len(radial_values) * 0.5)))]
+        radius_weight = sum(weight for _value, weight in outer)
+        fitted_radius = (
+            sum(value * weight for value, weight in outer) / radius_weight
+            if radius_weight > EPSILON else max(value for value, _weight in radial_values)
+        )
+        fitted_heights.append(fitted_height)
+        fitted_radii.append(max(fitted_radius, height_span * 0.005))
+
+    fitted_heights = _periodic_smooth_values(fitted_heights, passes=2)
+    fitted_radii = _periodic_smooth_values(fitted_radii, passes=2)
+    profile_points = []
+    for sample, (height, radius) in enumerate(zip(fitted_heights, fitted_radii)):
+        raw_u = sample / sample_count
+        radial = _radial_at_u(raw_u, right, back)
+        axis_point = center + up * (height - center.dot(up))
+        profile_points.append(axis_point + radial * radius * 1.03)
+
+    return {
+        "points": profile_points,
+        "center": center,
+        "up": up,
+        "right": right,
+        "back": back,
+        "point_u": point_u,
+        "source_points": points,
+        "source_heights": heights,
+    }
+
+
+def _profile_point_at(profile, raw_u):
+    points = profile["points"]
+    if not points:
+        return Vector(profile["center"])
+    value = (float(raw_u) % 1.0) * len(points)
+    first = int(math.floor(value)) % len(points)
+    second = (first + 1) % len(points)
+    return Vector(points[first]).lerp(
+        Vector(points[second]),
+        value - math.floor(value),
+    )
+
+
+def _fit_asymmetric_control_positions(records, armature_obj):
+    standard, display_size = _fit_control_positions(records, armature_obj)
+    profile = _fit_smooth_hem_profile(records, armature_obj)
+    center = profile["center"]
+    up = profile["up"]
+    right = profile["right"]
+    back = profile["back"]
+    source_points = profile["source_points"]
+    source_heights = profile["source_heights"]
+    source_u = profile["point_u"]
+    direction_u = {
+        "Front": 0.0,
+        "Right": 0.25,
+        "Back": 0.5,
+        "Left": 0.75,
+    }
+
+    controls = {direction: [] for direction in CONTROL_DIRECTIONS}
+    for direction in CONTROL_DIRECTIONS:
+        raw_u = direction_u[direction]
+        radial = _radial_at_u(raw_u, right, back)
+        top_point = Vector(standard[direction][0])
+        bottom_point = _profile_point_at(profile, raw_u)
+        top_height = top_point.dot(up)
+        bottom_height = bottom_point.dot(up)
+        local_span = max(top_height - bottom_height, EPSILON)
+
+        candidates = [
+            index for index, value in enumerate(source_u)
+            if _circular_distance(value, raw_u) <= 0.14
+        ]
+        if len(candidates) < 8:
+            candidates = sorted(
+                range(len(source_points)),
+                key=lambda index: _circular_distance(source_u[index], raw_u),
+            )[:min(max(8, len(source_points) // 8), len(source_points))]
+
+        direction_points = [top_point]
+        for level in range(1, CONTROL_LEVELS - 1):
+            local_v = level / (CONTROL_LEVELS - 1)
+            target_height = top_height * (1.0 - local_v) + bottom_height * local_v
+            ranked = sorted(
+                candidates,
+                key=lambda index: (
+                    abs(source_heights[index] - target_height) / local_span
+                    + _circular_distance(source_u[index], raw_u) * 1.5
+                ),
+            )
+            chosen = ranked[:min(max(5, len(ranked) // 8), 24)]
+            values = []
+            for index in chosen:
+                height_error = abs(source_heights[index] - target_height) / local_span
+                angular = _circular_distance(source_u[index], raw_u) / 0.14
+                weight = 1.0 / (0.03 + height_error * height_error + angular * angular)
+                axis_point = center + up * (source_heights[index] - center.dot(up))
+                radius = max((source_points[index] - axis_point).dot(radial), 0.0)
+                values.append((source_heights[index], radius, weight))
+            total = sum(weight for _height, _radius, weight in values)
+            if total > EPSILON:
+                height = sum(height * weight for height, _radius, weight in values) / total
+                outer = sorted(values, key=lambda item: item[1], reverse=True)
+                outer = outer[:max(1, int(math.ceil(len(outer) * 0.5)))]
+                outer_total = sum(weight for _height, _radius, weight in outer)
+                radius = sum(radius * weight for _height, radius, weight in outer) / outer_total
+                axis_point = center + up * (height - center.dot(up))
+                direction_points.append(axis_point + radial * radius * 1.03)
+            else:
+                direction_points.append(top_point.lerp(bottom_point, local_v))
+        direction_points.append(bottom_point)
+        controls[direction] = direction_points
+
+    return controls, display_size, profile
+
 def _create_or_update_controls(
     mesh_obj,
     settings,
@@ -1173,9 +1431,17 @@ def generate_control_points(context, settings):
     if old_prefix != settings.prefix:
         delete_generated_controls(settings.prefix, primary_mesh.name)
 
-    controls, display_size = _fit_control_positions(
-        combined_records, settings.target_armature
-    )
+    if settings.skirt_shape_mode == 'ASYMMETRIC':
+        controls, display_size, _profile = _fit_asymmetric_control_positions(
+            combined_records, settings.target_armature
+        )
+        _store_asym_base_l3(primary_mesh, controls)
+    else:
+        controls, display_size = _fit_control_positions(
+            combined_records, settings.target_armature
+        )
+        if PROP_ASYM_BASE_L3 in primary_mesh:
+            del primary_mesh[PROP_ASYM_BASE_L3]
     collection = _create_or_update_controls(
         primary_mesh, settings, controls, display_size, update_existing=False
     )
@@ -1218,9 +1484,17 @@ def _refit_control_points(context, settings):
         raise ValueError("Control Collection does not exist; generate controls first.")
     find_control_points(collection, settings.prefix, require_all=True)
 
-    controls, display_size = _fit_control_positions(
-        combined_records, settings.target_armature
-    )
+    if settings.skirt_shape_mode == 'ASYMMETRIC':
+        controls, display_size, _profile = _fit_asymmetric_control_positions(
+            combined_records, settings.target_armature
+        )
+        _store_asym_base_l3(primary_mesh, controls)
+    else:
+        controls, display_size = _fit_control_positions(
+            combined_records, settings.target_armature
+        )
+        if PROP_ASYM_BASE_L3 in primary_mesh:
+            del primary_mesh[PROP_ASYM_BASE_L3]
     _create_or_update_controls(
         primary_mesh, settings, controls, display_size, update_existing=True
     )
@@ -2578,6 +2852,821 @@ def apply_proxy_mesh_weights(
     return assignments
 
 
+def _periodic_cardinal_scalar(values, raw_u):
+    phase = (float(raw_u) % 1.0) * 4.0
+    first = int(math.floor(phase)) % 4
+    factor = (1.0 - math.cos((phase - math.floor(phase)) * math.pi)) * 0.5
+    return _lerp_float(values[first], values[(first + 1) % 4], factor)
+
+
+def _periodic_cardinal_point(points, raw_u):
+    """Clamped periodic Catmull-Rom through Front/Right/Back/Left."""
+    phase = (float(raw_u) % 1.0) * 4.0
+    segment = int(math.floor(phase)) % 4
+    t = phase - math.floor(phase)
+    p0 = Vector(points[(segment - 1) % 4])
+    p1 = Vector(points[segment])
+    p2 = Vector(points[(segment + 1) % 4])
+    p3 = Vector(points[(segment + 2) % 4])
+    t2 = t * t
+    t3 = t2 * t
+    value = (
+        p1 * 2.0
+        + (p2 - p0) * t
+        + (p0 * 2.0 - p1 * 5.0 + p2 * 4.0 - p3) * t2
+        + (-p0 + p1 * 3.0 - p2 * 3.0 + p3) * t3
+    ) * 0.5
+    for axis in range(3):
+        value[axis] = clamp(
+            value[axis],
+            min(p1[axis], p2[axis]),
+            max(p1[axis], p2[axis]),
+        )
+    return value
+
+
+def _apply_asymmetric_hem_offsets(profile, control_points, base_l3):
+    up = profile["up"]
+    right = profile["right"]
+    back = profile["back"]
+    direction_u = (0.0, 0.25, 0.5, 0.75)
+    longitudinal = []
+    radial_offsets = []
+    for direction, raw_u in zip(CONTROL_DIRECTIONS, direction_u):
+        current = Vector(control_points[direction][-1])
+        baseline = Vector(base_l3.get(direction, current))
+        offset = current - baseline
+        radial = _radial_at_u(raw_u, right, back)
+        longitudinal.append(offset.dot(up))
+        radial_offsets.append(offset.dot(radial))
+
+    adjusted = dict(profile)
+    adjusted_points = []
+    for index, point in enumerate(profile["points"]):
+        raw_u = index / len(profile["points"])
+        radial = _radial_at_u(raw_u, right, back)
+        long_value = _periodic_cardinal_scalar(longitudinal, raw_u)
+        radial_value = _periodic_cardinal_scalar(radial_offsets, raw_u)
+        adjusted_points.append(
+            Vector(point) + up * long_value + radial * radial_value
+        )
+    adjusted["points"] = [
+        adjusted_points[(index - 1) % len(adjusted_points)] * 0.15
+        + adjusted_points[index] * 0.70
+        + adjusted_points[(index + 1) % len(adjusted_points)] * 0.15
+        for index in range(len(adjusted_points))
+    ]
+    return adjusted
+
+
+def _asym_ring_point(control_points, hem_profile, level, raw_u):
+    if level == CONTROL_LEVELS - 1:
+        return _profile_point_at(hem_profile, raw_u)
+    points = [
+        control_points[direction][level]
+        for direction in CONTROL_DIRECTIONS
+    ]
+    return _periodic_cardinal_point(points, raw_u)
+
+
+def _asym_control_surface_point(control_points, hem_profile, raw_u, local_v):
+    rail_controls = [
+        _asym_ring_point(control_points, hem_profile, level, raw_u)
+        for level in range(CONTROL_LEVELS)
+    ]
+    return interpolate_vertical_control(rail_controls, local_v)
+
+
+def _build_average_arc_mapping(control_points, hem_profile, resolution=128):
+    resolution = max(int(resolution), 32)
+    rings = [
+        [
+            _asym_ring_point(
+                control_points,
+                hem_profile,
+                level,
+                sample / resolution,
+            )
+            for sample in range(resolution)
+        ]
+        for level in range(CONTROL_LEVELS)
+    ]
+    cumulative = [0.0]
+    for sample in range(resolution):
+        following = (sample + 1) % resolution
+        length = sum(
+            (rings[level][following] - rings[level][sample]).length
+            for level in range(CONTROL_LEVELS)
+        ) / CONTROL_LEVELS
+        cumulative.append(cumulative[-1] + max(length, EPSILON))
+    return {
+        "resolution": resolution,
+        "cumulative": cumulative,
+        "total": cumulative[-1],
+    }
+
+
+def _raw_u_from_arc_s(mapping, arc_s):
+    target = (float(arc_s) % 1.0) * mapping["total"]
+    cumulative = mapping["cumulative"]
+    low = 0
+    high = mapping["resolution"]
+    while low + 1 < high:
+        middle = (low + high) // 2
+        if cumulative[middle] <= target:
+            low = middle
+        else:
+            high = middle
+    span = cumulative[low + 1] - cumulative[low]
+    factor = 0.0 if span <= EPSILON else (
+        (target - cumulative[low]) / span
+    )
+    return (low + factor) / mapping["resolution"]
+
+
+def _arc_s_from_raw_u(mapping, raw_u):
+    value = (float(raw_u) % 1.0) * mapping["resolution"]
+    index = int(math.floor(value)) % mapping["resolution"]
+    factor = value - math.floor(value)
+    cumulative = mapping["cumulative"]
+    distance = _lerp_float(
+        cumulative[index],
+        cumulative[index + 1],
+        factor,
+    )
+    return distance / max(mapping["total"], EPSILON)
+
+
+def _closest_polyline_parameter(point, polyline):
+    points = [Vector(value) for value in polyline]
+    if len(points) < 2:
+        return 0.0
+    cumulative = [0.0]
+    for index in range(len(points) - 1):
+        cumulative.append(
+            cumulative[-1] + (points[index + 1] - points[index]).length
+        )
+    total = cumulative[-1]
+    if total <= EPSILON:
+        return 0.0
+
+    best_distance = float('inf')
+    best_arc = 0.0
+    point = Vector(point)
+    for index in range(len(points) - 1):
+        segment = points[index + 1] - points[index]
+        if segment.length_squared <= EPSILON:
+            factor = 0.0
+        else:
+            factor = clamp(
+                (point - points[index]).dot(segment) / segment.length_squared,
+                0.0,
+                1.0,
+            )
+        closest = points[index] + segment * factor
+        distance = (point - closest).length_squared
+        if distance < best_distance:
+            best_distance = distance
+            best_arc = cumulative[index] + segment.length * factor
+    return clamp(best_arc / total, 0.0, 1.0)
+
+
+def _initial_asym_parameters(
+    surface_points,
+    control_points,
+    hem_profile,
+    arc_mapping,
+):
+    center = hem_profile["center"]
+    right = hem_profile["right"]
+    back = hem_profile["back"]
+    rail_cache = {}
+    parameters = []
+    for point in surface_points:
+        raw_u = _raw_skirt_u(point, center, right, back)
+        cache_index = int(round(raw_u * arc_mapping["resolution"])) % arc_mapping["resolution"]
+        if cache_index not in rail_cache:
+            cached_u = cache_index / arc_mapping["resolution"]
+            rail_cache[cache_index] = [
+                _asym_control_surface_point(
+                    control_points,
+                    hem_profile,
+                    cached_u,
+                    step / 32.0,
+                )
+                for step in range(33)
+            ]
+        local_v = _closest_polyline_parameter(
+            point,
+            rail_cache[cache_index],
+        )
+        parameters.append((
+            _arc_s_from_raw_u(arc_mapping, raw_u),
+            local_v,
+        ))
+    return parameters
+
+def _fit_asym_dense_point(
+    target,
+    center,
+    target_s,
+    target_v,
+    candidates,
+    surface_points,
+    surface_parameters,
+    bone_inset,
+    ring_fit_strength,
+):
+    radial_vector = Vector(target) - Vector(center)
+    cage_radius = radial_vector.length
+    if cage_radius <= EPSILON:
+        return Vector(target)
+    radial = radial_vector / cage_radius
+    maximum = cage_radius * (1.0 - clamp(float(bone_inset), 0.0, 0.95))
+
+    band = 0.06
+    nearby = []
+    for _attempt in range(6):
+        nearby = [
+            index for index in candidates
+            if abs(surface_parameters[index][1] - target_v) <= band
+        ]
+        if len(nearby) >= 4:
+            break
+        band = min(band * 1.7, 0.5)
+    if not nearby:
+        nearby = candidates
+
+    scored = []
+    for index in nearby:
+        delta = Vector(surface_points[index]) - Vector(center)
+        radius = delta.dot(radial)
+        if radius <= 0.0 or delta.length_squared <= EPSILON:
+            continue
+        direction_score = delta.normalized().dot(radial)
+        if direction_score <= 0.10:
+            continue
+        ds = _circular_distance(surface_parameters[index][0], target_s)
+        dv = abs(surface_parameters[index][1] - target_v)
+        angular_score = max(1.0 - ds / 0.25, 0.05)
+        vertical_score = max(1.0 - dv / max(band, EPSILON), 0.05)
+        weight = direction_score * angular_score * vertical_score
+        scored.append((radius, weight))
+    if not scored:
+        return Vector(center) + radial * maximum
+
+    scored.sort(key=lambda item: item[0], reverse=True)
+    selected = scored[:min(5, len(scored))]
+    total = sum(weight for _radius, weight in selected)
+    fitted = (
+        sum(radius * weight for radius, weight in selected) / total
+        if total > EPSILON else selected[0][0]
+    )
+    fitted = clamp(fitted, 0.0, maximum)
+    radius = _lerp_float(
+        maximum,
+        fitted,
+        clamp(float(ring_fit_strength), 0.0, 1.0),
+    )
+    return Vector(center) + radial * radius
+
+
+def build_asymmetric_joint_grid(
+    control_points,
+    surface_points,
+    settings,
+    base_l3,
+):
+    profile = _fit_smooth_hem_profile(
+        [{"world": Vector(point)} for point in surface_points],
+        settings.target_armature,
+        sample_count=max(128, settings.columns * 8),
+    )
+    hem_profile = _apply_asymmetric_hem_offsets(
+        profile,
+        control_points,
+        base_l3,
+    )
+    arc_mapping = _build_average_arc_mapping(
+        control_points,
+        hem_profile,
+        resolution=max(128, settings.columns * 8),
+    )
+    surface_parameters = _initial_asym_parameters(
+        surface_points,
+        control_points,
+        hem_profile,
+        arc_mapping,
+    )
+
+    dense_count = min(max(settings.rows * 4, 48), 256)
+    center_sample_count = max(settings.columns * 2, 32)
+    centers = []
+    for step in range(dense_count + 1):
+        local_v = step / dense_count
+        centers.append(_average_points([
+            _asym_control_surface_point(
+                control_points,
+                hem_profile,
+                _raw_u_from_arc_s(
+                    arc_mapping,
+                    sample / center_sample_count,
+                ),
+                local_v,
+            )
+            for sample in range(center_sample_count)
+        ]))
+
+    chains = []
+    for column in range(settings.columns):
+        target_s = column / settings.columns
+        raw_u = _raw_u_from_arc_s(arc_mapping, target_s)
+        window = max(1.75 / settings.columns, 0.04)
+        candidates = []
+        for _attempt in range(6):
+            candidates = [
+                index for index, (point_s, _point_v) in enumerate(surface_parameters)
+                if _circular_distance(point_s, target_s) <= window
+            ]
+            if len(candidates) >= 8:
+                break
+            window = min(window * 1.6, 0.5)
+        if not candidates:
+            candidates = list(range(len(surface_points)))
+
+        dense_chain = []
+        for step in range(dense_count + 1):
+            local_v = step / dense_count
+            target = _asym_control_surface_point(
+                control_points,
+                hem_profile,
+                raw_u,
+                local_v,
+            )
+            dense_chain.append(_fit_asym_dense_point(
+                target,
+                centers[step],
+                target_s,
+                local_v,
+                candidates,
+                surface_points,
+                surface_parameters,
+                settings.bone_inset,
+                settings.ring_fit_strength,
+            ))
+        chains.append(_equal_chord_chain(dense_chain, settings.rows))
+
+    joint_grid = [
+        [chains[column][row] for column in range(settings.columns)]
+        for row in range(settings.rows + 1)
+    ]
+    chain_lengths = [
+        sum(
+            (chains[column][row + 1] - chains[column][row]).length
+            for row in range(settings.rows)
+        )
+        for column in range(settings.columns)
+    ]
+    return joint_grid, chain_lengths, hem_profile, arc_mapping
+
+
+def _joint_surface_point(joint_grid, arc_s, local_v):
+    row_count = len(joint_grid)
+    columns = len(joint_grid[0]) if row_count else 0
+    if row_count < 2 or columns < 2:
+        return Vector((0.0, 0.0, 0.0))
+
+    row_value = clamp(float(local_v), 0.0, 1.0) * (row_count - 1)
+    row0 = min(int(math.floor(row_value)), row_count - 1)
+    row1 = min(row0 + 1, row_count - 1)
+    row_factor = row_value - math.floor(row_value)
+
+    column_value = (float(arc_s) % 1.0) * columns
+    column0 = int(math.floor(column_value)) % columns
+    column1 = (column0 + 1) % columns
+    column_factor = column_value - math.floor(column_value)
+
+    first = Vector(joint_grid[row0][column0]).lerp(
+        Vector(joint_grid[row0][column1]),
+        column_factor,
+    )
+    second = Vector(joint_grid[row1][column0]).lerp(
+        Vector(joint_grid[row1][column1]),
+        column_factor,
+    )
+    return first.lerp(second, row_factor)
+
+
+def _build_asymmetric_parameter_projector(joint_grid):
+    bone_count = len(joint_grid) - 1
+    columns = len(joint_grid[0]) if joint_grid else 0
+    if bone_count < 1 or columns < 4:
+        raise ValueError("不对称参数曲面关节点无效")
+
+    s_resolution = min(max(columns * 4, 64), 512)
+    v_resolution = min(max(bone_count * 4, 32), 512)
+    vertices = [
+        _joint_surface_point(
+            joint_grid,
+            column / s_resolution,
+            row / v_resolution,
+        )
+        for row in range(v_resolution + 1)
+        for column in range(s_resolution)
+    ]
+    triangles = []
+    triangle_uv = []
+    for row in range(v_resolution):
+        v0 = row / v_resolution
+        v1 = (row + 1) / v_resolution
+        for column in range(s_resolution):
+            following = (column + 1) % s_resolution
+            s0 = column / s_resolution
+            s1 = (column + 1) / s_resolution
+            a = row * s_resolution + column
+            b = row * s_resolution + following
+            c = (row + 1) * s_resolution + column
+            d = (row + 1) * s_resolution + following
+            triangles.append((a, b, d))
+            triangle_uv.append((
+                Vector((s0, v0)),
+                Vector((s1, v0)),
+                Vector((s1, v1)),
+            ))
+            triangles.append((a, d, c))
+            triangle_uv.append((
+                Vector((s0, v0)),
+                Vector((s1, v1)),
+                Vector((s0, v1)),
+            ))
+    tree = BVHTree.FromPolygons(vertices, triangles, all_triangles=True)
+    return tree, vertices, triangles, triangle_uv
+
+
+def _barycentric_coordinates(point, first, second, third):
+    first = Vector(first)
+    second = Vector(second)
+    third = Vector(third)
+    point = Vector(point)
+    edge0 = second - first
+    edge1 = third - first
+    delta = point - first
+    d00 = edge0.dot(edge0)
+    d01 = edge0.dot(edge1)
+    d11 = edge1.dot(edge1)
+    d20 = delta.dot(edge0)
+    d21 = delta.dot(edge1)
+    denominator = d00 * d11 - d01 * d01
+    if abs(denominator) <= EPSILON:
+        return 1.0, 0.0, 0.0
+    second_weight = (d11 * d20 - d01 * d21) / denominator
+    third_weight = (d00 * d21 - d01 * d20) / denominator
+    first_weight = 1.0 - second_weight - third_weight
+    return first_weight, second_weight, third_weight
+
+
+def _project_asymmetric_parameters(point, projector):
+    tree, vertices, triangles, triangle_uv = projector
+    nearest = tree.find_nearest(Vector(point))
+    if nearest is None or nearest[2] is None:
+        return 0.0, 0.0
+    location, _normal, triangle_index, _distance = nearest
+    triangle = triangles[triangle_index]
+    weights = _barycentric_coordinates(
+        location,
+        vertices[triangle[0]],
+        vertices[triangle[1]],
+        vertices[triangle[2]],
+    )
+    uv_values = triangle_uv[triangle_index]
+    uv = (
+        uv_values[0] * weights[0]
+        + uv_values[1] * weights[1]
+        + uv_values[2] * weights[2]
+    )
+    return uv.x % 1.0, clamp(uv.y, 0.0, 1.0)
+
+def _interpolate_cyclic_values(values, arc_s):
+    if not values:
+        return 0.0
+    value = (float(arc_s) % 1.0) * len(values)
+    first = int(math.floor(value)) % len(values)
+    second = (first + 1) % len(values)
+    return _lerp_float(
+        values[first],
+        values[second],
+        value - math.floor(value),
+    )
+
+
+def _median_value(values):
+    ordered = sorted(float(value) for value in values)
+    if not ordered:
+        return 0.0
+    middle = len(ordered) // 2
+    if len(ordered) % 2:
+        return ordered[middle]
+    return (ordered[middle - 1] + ordered[middle]) * 0.5
+
+
+def _asymmetric_parent_weight(arc_s, local_v, chain_lengths):
+    reference_length = _median_value(chain_lengths)
+    blend_distance = reference_length * 0.15
+    if blend_distance <= EPSILON:
+        return 0.0
+    local_length = _interpolate_cyclic_values(chain_lengths, arc_s)
+    distance = clamp(float(local_v), 0.0, 1.0) * local_length
+    if distance >= blend_distance:
+        return 0.0
+    return 1.0 - smoothstep(distance / blend_distance)
+
+
+def compute_asymmetric_vertex_weights(
+    arc_s,
+    local_v,
+    rows,
+    columns,
+    prefix,
+    settings,
+    parent_weight,
+):
+    # Influence nodes are centered in each equal-length chain segment.
+    row_value = clamp(float(local_v) * rows - 0.5, 0.0, rows - 1.0)
+    row0 = min(int(math.floor(row_value)), rows - 1)
+    row1 = min(row0 + 1, rows - 1)
+    row_factor = row_value - math.floor(row_value)
+    row_weight0, row_weight1 = _vertical_weights(
+        row_factor,
+        settings.weight_curve,
+    )
+
+    column_value = (float(arc_s) % 1.0) * columns
+    base_column = int(math.floor(column_value))
+    column0 = base_column % columns
+    column1 = (column0 + 1) % columns
+    column_factor = column_value - base_column
+    column_weight1 = smoothstep(column_factor)
+    column_weight0 = 1.0 - column_weight1
+
+    skirt_scale = 1.0 - clamp(float(parent_weight), 0.0, 1.0)
+    weights = {}
+    for row, column, value in (
+        (row0, column0, row_weight0 * column_weight0),
+        (row0, column1, row_weight0 * column_weight1),
+        (row1, column0, row_weight1 * column_weight0),
+        (row1, column1, row_weight1 * column_weight1),
+    ):
+        name = _bone_name(prefix, column, row)
+        weights[name] = weights.get(name, 0.0) + value * skirt_scale
+
+    weights = {
+        name: value for name, value in weights.items()
+        if value >= MIN_WEIGHT
+    }
+    parent_is_active = parent_weight >= MIN_WEIGHT
+    skirt_slots = settings.max_influences - (1 if parent_is_active else 0)
+    weights = dict(sorted(
+        weights.items(),
+        key=lambda item: item[1],
+        reverse=True,
+    )[:max(skirt_slots, 0)])
+    if parent_is_active:
+        weights[PARENT_WEIGHT_KEY] = parent_weight
+
+    if settings.normalize_weights:
+        total = sum(weights.values())
+        if total > EPSILON:
+            weights = {
+                name: value / total
+                for name, value in weights.items()
+            }
+    return weights
+
+
+def create_bones_from_joint_grid(
+    armature,
+    joint_grid,
+    parent_bone_name,
+    prefix,
+    sample_normals=None,
+    bone_collection_name="",
+):
+    if armature.type != 'ARMATURE' or armature.mode != 'EDIT':
+        raise ValueError("创建骨骼时 Armature 必须处于编辑模式")
+    bone_count = len(joint_grid) - 1
+    columns = len(joint_grid[0]) if joint_grid else 0
+    if bone_count < 1 or columns < 4:
+        raise ValueError("不对称裙摆关节点网格无效")
+    if any(len(row) != columns for row in joint_grid):
+        raise ValueError("不对称裙摆关节点列数不一致")
+
+    edit_bones = armature.data.edit_bones
+    parent_bone = edit_bones.get(parent_bone_name)
+    if parent_bone is None:
+        raise ValueError(f"找不到父骨骼：{parent_bone_name}")
+    bone_collection = _get_or_create_bone_collection(
+        armature.data,
+        bone_collection_name,
+    )
+
+    requested_names = {
+        _bone_name(prefix, column, row)
+        for column in range(columns)
+        for row in range(bone_count)
+    }
+    temporary_names = {
+        _temporary_bone_name(prefix, column, row)
+        for column in range(columns)
+        for row in range(bone_count)
+    }
+    conflicts = sorted(
+        name for name in requested_names | temporary_names
+        if edit_bones.get(name)
+    )
+    if conflicts:
+        raise ValueError(
+            "已存在同名生成骨骼；请启用“清除已有生成骨骼”："
+            + ", ".join(conflicts[:4])
+        )
+
+    inverse = armature.matrix_world.inverted()
+    normal_to_local = armature.matrix_world.to_3x3().transposed()
+    local_joints = [
+        [inverse @ Vector(point) for point in row]
+        for row in joint_grid
+    ]
+    local_normals = None
+    if sample_normals:
+        local_normals = [
+            [
+                _safe_normalized(
+                    normal_to_local @ Vector(sample_normals[row][column]),
+                    Vector((1.0, 0.0, 0.0)),
+                )
+                for column in range(columns)
+            ]
+            for row in range(min(len(sample_normals), bone_count + 1))
+        ]
+
+    created = []
+    renamed = []
+    for column in range(columns):
+        previous = None
+        for row in range(bone_count):
+            final_name = _bone_name(prefix, column, row)
+            bone = edit_bones.new(
+                _temporary_bone_name(prefix, column, row)
+            )
+            bone.head = local_joints[row][column]
+            bone.tail = local_joints[row + 1][column]
+            if (bone.tail - bone.head).length_squared <= EPSILON:
+                raise ValueError(
+                    f"不对称裙摆骨骼长度为零：C{column:02d} R{row:02d}"
+                )
+            bone.parent = parent_bone if row == 0 else previous
+            bone.use_connect = row > 0
+            bone.use_deform = True
+            if bone_collection is not None:
+                bone_collection.assign(bone)
+            target_normal = (
+                local_normals[row][column]
+                if local_normals and row < len(local_normals)
+                else Vector((1.0, 0.0, 0.0))
+            )
+            _align_bone_roll(bone, target_normal)
+            created.append(final_name)
+            renamed.append((bone, final_name))
+            previous = bone
+
+    for bone, final_name in renamed:
+        bone.name = final_name
+        if bone.name != final_name:
+            raise ValueError(f"Could not assign generated bone name: {final_name}")
+    return created
+
+
+def create_asymmetric_proxy_mesh(
+    joint_grid,
+    prefix="AutoSkirt_",
+    mesh_name="Mesh",
+):
+    rows = len(joint_grid)
+    columns = len(joint_grid[0]) if rows else 0
+    if rows < 2 or columns < 4:
+        return None
+    collection = get_or_create_collection(
+        _proxy_collection_name(prefix, mesh_name)
+    )
+    vertices = [
+        tuple(joint_grid[row][column])
+        for row in range(rows)
+        for column in range(columns)
+    ]
+    faces = []
+    for row in range(rows - 1):
+        for column in range(columns):
+            following = (column + 1) % columns
+            faces.append((
+                row * columns + column,
+                row * columns + following,
+                (row + 1) * columns + following,
+                (row + 1) * columns + column,
+            ))
+
+    mesh_data = bpy.data.meshes.new(f"{prefix}PROXY_{mesh_name}_Mesh")
+    mesh_data.from_pydata(vertices, [], faces)
+    mesh_data.update()
+    obj = bpy.data.objects.new(f"{prefix}PROXY_{mesh_name}", mesh_data)
+    collection.objects.link(obj)
+    obj.display_type = 'WIRE'
+    obj.show_wire = True
+    obj.show_in_front = True
+    obj.hide_render = True
+    obj[PROP_TARGET] = mesh_name
+    obj[PROP_KIND] = PROP_PROXY_KIND
+    return obj
+
+
+def apply_asymmetric_proxy_weights(
+    proxy_obj,
+    armature_obj,
+    joint_grid,
+    chain_lengths,
+    rows,
+    columns,
+    prefix,
+    parent_bone_name,
+    settings,
+):
+    if proxy_obj is None or proxy_obj.type != 'MESH':
+        return 0
+    indices = list(range(len(proxy_obj.data.vertices)))
+    weights = {}
+    for joint_row in range(rows + 1):
+        local_v = joint_row / rows
+        for column in range(columns):
+            index = joint_row * columns + column
+            arc_s = column / columns
+            parent_weight = _asymmetric_parent_weight(
+                arc_s,
+                local_v,
+                chain_lengths,
+            )
+            weights[index] = compute_asymmetric_vertex_weights(
+                arc_s,
+                local_v,
+                rows,
+                columns,
+                prefix,
+                settings,
+                parent_weight,
+            )
+    assignments = apply_weights(
+        proxy_obj,
+        indices,
+        weights,
+        prefix,
+        parent_bone_name,
+        True,
+        settings.top_blend_to_parent,
+    )
+    _ensure_armature_modifier(proxy_obj, armature_obj)
+    return assignments
+
+
+def _prepare_asymmetric_build_data(
+    primary_mesh,
+    armature,
+    control_points,
+    surface_points,
+    settings,
+):
+    base_l3 = _load_asym_base_l3(primary_mesh)
+    if any(direction not in base_l3 for direction in CONTROL_DIRECTIONS):
+        raise ValueError("不对称裙摆缺少 L3 拟合基准，请重新生成控制点")
+    joint_grid, chain_lengths, hem_profile, arc_mapping = (
+        build_asymmetric_joint_grid(
+            control_points,
+            surface_points,
+            settings,
+            base_l3,
+        )
+    )
+    proxy_normals = _proxy_grid_vertex_normals(joint_grid, True)
+    bone_z_axes = [
+        [-normal for normal in row]
+        for row in proxy_normals
+    ]
+    projector = _build_asymmetric_parameter_projector(joint_grid)
+    return {
+        "joint_grid": joint_grid,
+        "chain_lengths": chain_lengths,
+        "hem_profile": hem_profile,
+        "arc_mapping": arc_mapping,
+        "bone_z_axes": bone_z_axes,
+        "projector": projector,
+    }
+
 # ---------------------------------------------------------------------------
 # Build validation and orchestration
 # ---------------------------------------------------------------------------
@@ -2648,6 +3737,9 @@ def _validate_build(context, settings, require_selection):
         raise ValueError("Parent Bone does not exist in the Target Armature.")
 
     primary_mesh = mesh_objects[0]
+    stored_mode = str(primary_mesh.get(PROP_SHAPE_MODE, 'STANDARD'))
+    if stored_mode != settings.skirt_shape_mode:
+        raise ValueError("裙摆类型已改变，请重新生成控制点")
     collection_name = str(
         primary_mesh.get(
             PROP_COLLECTION,
@@ -2697,33 +3789,46 @@ def _build(context, settings, build_bones, build_weights):
         raise ValueError("At least four valid selected vertices are required.")
     surface_points = [record["world"] for record in surface_records]
     surface_normals = [record["normal"] for record in surface_records]
-    samples, _fitted_sample_normals = build_cage_samples(
-        control_points,
-        settings.rows,
-        settings.columns,
-        settings.bone_inset,
-        settings.closed_loop,
-        surface_points=surface_points,
-        surface_normals=surface_normals,
-        slice_thickness=settings.slice_thickness,
-        fit_mode=settings.fit_mode,
-        ring_fit_strength=settings.ring_fit_strength,
-        longitudinal_smoothing=settings.longitudinal_smoothing,
-        return_normals=True,
-    )
-    _configure_lr_suffix_naming(samples, settings.use_lr_suffix_names)
-    # The proxy grid is the roll reference. Bone local +Z must point opposite
-    # to its corresponding proxy vertex normal, including at low column counts.
-    proxy_samples = _uniform_proxy_row_samples(samples)
-    proxy_vertex_normals = _proxy_grid_vertex_normals(
-        proxy_samples,
-        settings.closed_loop,
-    )
-    bone_z_axes = [
-        [-normal for normal in row_normals]
-        for row_normals in proxy_vertex_normals
-    ]
+    asymmetric = settings.skirt_shape_mode == 'ASYMMETRIC'
 
+    asymmetric_data = None
+    if asymmetric:
+        asymmetric_data = _prepare_asymmetric_build_data(
+            primary_mesh,
+            armature,
+            control_points,
+            surface_points,
+            settings,
+        )
+        samples = asymmetric_data["joint_grid"]
+        bone_z_axes = asymmetric_data["bone_z_axes"]
+    else:
+        samples, _fitted_sample_normals = build_cage_samples(
+            control_points,
+            settings.rows,
+            settings.columns,
+            settings.bone_inset,
+            settings.closed_loop,
+            surface_points=surface_points,
+            surface_normals=surface_normals,
+            slice_thickness=settings.slice_thickness,
+            fit_mode=settings.fit_mode,
+            ring_fit_strength=settings.ring_fit_strength,
+            longitudinal_smoothing=settings.longitudinal_smoothing,
+            return_normals=True,
+        )
+        # Standard proxy behavior and roll reference are unchanged.
+        proxy_samples = _uniform_proxy_row_samples(samples)
+        proxy_vertex_normals = _proxy_grid_vertex_normals(
+            proxy_samples,
+            settings.closed_loop,
+        )
+        bone_z_axes = [
+            [-normal for normal in row_normals]
+            for row_normals in proxy_vertex_normals
+        ]
+
+    _configure_lr_suffix_naming(samples, settings.use_lr_suffix_names)
     state = _ContextState(context)
     created_bones = 0
     assignments = 0
@@ -2733,38 +3838,66 @@ def _build(context, settings, build_bones, build_weights):
             _activate_object(context, armature, mode='EDIT')
             if settings.clear_existing_generated_bones:
                 cleanup_generated_bones(armature, settings.prefix)
-            created = create_bones_from_samples(
-                armature,
-                samples,
-                settings.parent_bone,
-                settings.prefix,
-                False,
-                settings.closed_loop,
-                sample_normals=bone_z_axes,
-                bone_collection_name=settings.bone_collection,
-            )
+            if asymmetric:
+                created = create_bones_from_joint_grid(
+                    armature,
+                    asymmetric_data["joint_grid"],
+                    settings.parent_bone,
+                    settings.prefix,
+                    sample_normals=bone_z_axes,
+                    bone_collection_name=settings.bone_collection,
+                )
+            else:
+                created = create_bones_from_samples(
+                    armature,
+                    samples,
+                    settings.parent_bone,
+                    settings.prefix,
+                    False,
+                    settings.closed_loop,
+                    sample_normals=bone_z_axes,
+                    bone_collection_name=settings.bone_collection,
+                )
             created_bones = len(created)
             bpy.ops.object.mode_set(mode='OBJECT')
 
             _delete_debug_objects(settings.prefix, primary_mesh.name)
             _delete_proxy_objects(settings.prefix, primary_mesh.name)
             if settings.create_proxy_mesh:
-                proxy_obj = create_proxy_mesh(
-                    samples,
-                    settings.prefix,
-                    primary_mesh.name,
-                    settings.closed_loop,
-                )
-                apply_proxy_mesh_weights(
-                    proxy_obj,
-                    armature,
-                    control_points,
-                    settings.rows,
-                    settings.columns,
-                    settings.prefix,
-                    settings.parent_bone,
-                    settings,
-                )
+                if asymmetric:
+                    proxy_obj = create_asymmetric_proxy_mesh(
+                        asymmetric_data["joint_grid"],
+                        settings.prefix,
+                        primary_mesh.name,
+                    )
+                    apply_asymmetric_proxy_weights(
+                        proxy_obj,
+                        armature,
+                        asymmetric_data["joint_grid"],
+                        asymmetric_data["chain_lengths"],
+                        settings.rows,
+                        settings.columns,
+                        settings.prefix,
+                        settings.parent_bone,
+                        settings,
+                    )
+                else:
+                    proxy_obj = create_proxy_mesh(
+                        samples,
+                        settings.prefix,
+                        primary_mesh.name,
+                        settings.closed_loop,
+                    )
+                    apply_proxy_mesh_weights(
+                        proxy_obj,
+                        armature,
+                        control_points,
+                        settings.rows,
+                        settings.columns,
+                        settings.prefix,
+                        settings.parent_bone,
+                        settings,
+                    )
             if settings.create_debug_curves:
                 create_debug_curves(
                     samples,
@@ -2783,20 +3916,40 @@ def _build(context, settings, build_bones, build_weights):
                 matrix_world = mesh_obj.matrix_world
                 for index in selected_indices:
                     vertex_world = matrix_world @ mesh_obj.data.vertices[index].co
-                    h, u = compute_vertex_cage_parameters(
-                        vertex_world,
-                        control_points,
-                        settings.closed_loop,
-                    )
-                    all_weights[index] = compute_vertex_weights(
-                        vertex_world,
-                        h,
-                        u,
-                        settings.rows,
-                        settings.columns,
-                        settings.prefix,
-                        settings,
-                    )
+                    if asymmetric:
+                        arc_s, local_v = _project_asymmetric_parameters(
+                            vertex_world,
+                            asymmetric_data["projector"],
+                        )
+                        parent_weight = _asymmetric_parent_weight(
+                            arc_s,
+                            local_v,
+                            asymmetric_data["chain_lengths"],
+                        )
+                        all_weights[index] = compute_asymmetric_vertex_weights(
+                            arc_s,
+                            local_v,
+                            settings.rows,
+                            settings.columns,
+                            settings.prefix,
+                            settings,
+                            parent_weight,
+                        )
+                    else:
+                        h, u = compute_vertex_cage_parameters(
+                            vertex_world,
+                            control_points,
+                            settings.closed_loop,
+                        )
+                        all_weights[index] = compute_vertex_weights(
+                            vertex_world,
+                            h,
+                            u,
+                            settings.rows,
+                            settings.columns,
+                            settings.prefix,
+                            settings,
+                        )
                 assignments += apply_weights(
                     mesh_obj,
                     selected_indices,
@@ -2832,7 +3985,6 @@ def _build(context, settings, build_bones, build_weights):
         "assignments": assignments,
         "modifier_added": modifier_added,
     }
-
 
 def _delete_generated_bones_and_groups(context, settings):
     mesh_objects = _resolve_target_meshes(context, settings)
@@ -3058,6 +4210,10 @@ class AUTOSKIRT_OT_delete_controls(bpy.types.Operator):
                 del mesh_obj[PROP_COLLECTION]
             if PROP_TARGETS in mesh_obj:
                 del mesh_obj[PROP_TARGETS]
+            if PROP_ASYM_BASE_L3 in mesh_obj:
+                del mesh_obj[PROP_ASYM_BASE_L3]
+            if PROP_SHAPE_MODE in mesh_obj:
+                del mesh_obj[PROP_SHAPE_MODE]
 
         self.report({'INFO'}, f"已删除 {removed} 个生成控制点")
         return {'FINISHED'}
@@ -3111,6 +4267,14 @@ class AUTOSKIRT_PG_settings(bpy.types.PropertyGroup):
     prefix: StringProperty(
         name="命名前缀",
         default="AutoSkirt_",
+    )
+    skirt_shape_mode: EnumProperty(
+        name="裙摆类型",
+        items=(
+            ('STANDARD', "标准裙摆", "使用原有稳定的闭合裙摆算法"),
+            ('ASYMMETRIC', "不对称裙摆", "腰口对称，按每条骨骼链的局部裙长拟合"),
+        ),
+        default='STANDARD',
     )
     use_lr_suffix_names: BoolProperty(
         name="左右后缀 (.L/.R)",
@@ -3301,6 +4465,7 @@ class AUTOSKIRT_PT_main(bpy.types.Panel):
         option_box.label(text="生成选项")
         option_box.prop(settings, "prefix")
         option_box.prop(settings, "use_lr_suffix_names")
+        option_box.prop(settings, "skirt_shape_mode")
         option_box.prop(settings, "rows")
         option_box.prop(settings, "columns")
         option_box.prop(settings, "create_proxy_mesh")
