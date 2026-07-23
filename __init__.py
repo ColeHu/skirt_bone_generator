@@ -4,7 +4,7 @@
 bl_info = {
     "name": "裙子骨骼生成器",
     "author": "Akazure",
-    "version": (1, 3, 0),
+    "version": (1, 4, 0),
     "blender": (4, 5, 0),
     "location": "3D 视图 > 右侧边栏 > 自动裙骨",
     "description": "根据控制点生成裙子骨骼",
@@ -35,6 +35,12 @@ from mathutils.bvhtree import BVHTree
 
 CONTROL_DIRECTIONS = ("Front", "Right", "Back", "Left")
 CONTROL_LEVELS = 4
+CONTROL_CHAIN_COLORS = {
+    "Front": (1.0, 0.18, 0.08, 1.0),
+    "Right": (0.10, 0.90, 0.24, 1.0),
+    "Back": (0.10, 0.42, 1.0, 1.0),
+    "Left": (0.86, 0.16, 1.0, 1.0),
+}
 EPSILON = 1.0e-8
 MIN_WEIGHT = 0.001
 PARENT_WEIGHT_KEY = "__AUTO_SKIRT_PARENT__"
@@ -61,6 +67,11 @@ _MIRROR_GUARD = False
 _LR_SUFFIX_NAMING_ENABLED = False
 _LR_SUFFIX_COLUMN_MAP = {}
 _SELECTION_MARKER_DRAW_HANDLE = None
+_LIVE_PROXY_CACHE = {
+    "signature": None,
+    "triangles": [],
+    "lines": [],
+}
 
 
 # ---------------------------------------------------------------------------
@@ -627,6 +638,9 @@ def _control_edit_collection(context, settings):
     if collection is None:
         raise ValueError("找不到控制点集合，请先生成控制点")
     controls = find_control_points(collection, settings.prefix, require_all=True)
+    for direction in CONTROL_DIRECTIONS:
+        for obj in controls[direction]:
+            obj.color = CONTROL_CHAIN_COLORS[direction]
     return mesh_obj, collection, controls
 
 
@@ -714,6 +728,7 @@ def _enter_control_edit_mode(context, settings, collection=None):
     settings.control_edit_last_positions = settings.control_edit_snapshot
     settings.control_edit_hide_select_state = _capture_hide_select_state(context, controls)
     settings.control_edit_active = True
+    _LIVE_PROXY_CACHE["signature"] = None
 
     if context.active_object is not None and context.active_object.mode != 'OBJECT':
         bpy.ops.object.mode_set(mode='OBJECT')
@@ -760,6 +775,9 @@ def _leave_control_edit_mode(context, settings, reset=False):
     settings.control_edit_last_positions = ""
     settings.control_edit_snapshot = ""
     settings.control_edit_hide_select_state = ""
+    _LIVE_PROXY_CACHE["signature"] = None
+    _LIVE_PROXY_CACHE["triangles"] = []
+    _LIVE_PROXY_CACHE["lines"] = []
     for area in context.screen.areas if context.screen else []:
         area.tag_redraw()
 
@@ -913,6 +931,7 @@ def _draw_control_edit_header(self, context):
     row.label(text="控制点编辑", icon='EMPTY_AXIS')
     row.prop(settings, "control_mirror_x", text="X 镜像")
     row.prop(settings, "control_mirror_y", text="Y 镜像")
+    row.prop(settings, "control_live_proxy_preview", text="实时代理")
     row.operator("auto_skirt.reset_control_edit", text="复原", icon='LOOP_BACK')
     row.operator("auto_skirt.cancel_control_edit", text="取消", icon='CANCEL')
     row.operator("auto_skirt.finish_control_edit", text="完成", icon='CHECKMARK')
@@ -945,59 +964,210 @@ def _control_edit_selected_world_positions(scene):
 
 
 def _control_edit_control_world_positions(scene):
-    """Return the 16 editable control Empty positions for the green overlay."""
+    """Return editable control positions grouped by their colored chain."""
     if scene is None or not hasattr(scene, "auto_skirt_settings"):
-        return []
+        return {}
     settings = scene.auto_skirt_settings
     if not settings.control_edit_active:
-        return []
+        return {}
     primary_mesh = bpy.data.objects.get(settings.control_edit_mesh_name)
     if primary_mesh is None:
         primary_mesh = settings.target_mesh
     if primary_mesh is None or primary_mesh.type != 'MESH':
-        return []
+        return {}
     collection_name = str(primary_mesh.get(
         PROP_COLLECTION,
         _control_collection_name(settings.prefix, primary_mesh.name),
     ))
     collection = bpy.data.collections.get(collection_name)
     controls = find_control_points(collection, settings.prefix, require_all=False)
-    return [
-        obj.matrix_world.translation.copy()
-        for obj in _flatten_control_objects(controls)
+    return {
+        direction: [
+            obj.matrix_world.translation.copy()
+            for obj in controls.get(direction, [])
+            if obj is not None
+        ]
+        for direction in CONTROL_DIRECTIONS
+    }
+
+
+def _proxy_draw_geometry(samples, closed_loop=True):
+    """Convert a sampled grid to translucent triangles and visible grid lines."""
+    rows = len(samples)
+    columns = len(samples[0]) if rows else 0
+    if rows < 2 or columns < 2:
+        return [], []
+    triangles = []
+    lines = []
+    column_limit = columns if closed_loop else columns - 1
+    for row in range(rows):
+        for column in range(column_limit):
+            following = (column + 1) % columns
+            lines.extend((samples[row][column], samples[row][following]))
+    for row in range(rows - 1):
+        for column in range(columns):
+            lines.extend((samples[row][column], samples[row + 1][column]))
+        for column in range(column_limit):
+            following = (column + 1) % columns
+            first = samples[row][column]
+            second = samples[row][following]
+            third = samples[row + 1][following]
+            fourth = samples[row + 1][column]
+            triangles.extend((first, second, third, first, third, fourth))
+    return triangles, lines
+
+
+def _live_proxy_signature(settings, primary_mesh, controls):
+    values = [
+        primary_mesh.name,
+        settings.skirt_shape_mode,
+        int(settings.rows),
+        int(settings.columns),
+        round(float(settings.bone_inset), 6),
+        round(float(settings.slice_thickness), 6),
+        settings.fit_mode,
+        round(float(settings.ring_fit_strength), 6),
+        bool(settings.longitudinal_smoothing),
     ]
+    for direction in CONTROL_DIRECTIONS:
+        for obj in controls[direction]:
+            point = obj.matrix_world.translation
+            values.extend(round(float(component), 6) for component in point)
+    return tuple(values)
+
+
+def _control_edit_live_proxy_geometry(scene):
+    """Build and cache the same proxy surface used by the final skirt build."""
+    settings = getattr(scene, "auto_skirt_settings", None)
+    if (
+        settings is None
+        or not settings.control_edit_active
+        or not settings.control_live_proxy_preview
+    ):
+        _LIVE_PROXY_CACHE["signature"] = None
+        _LIVE_PROXY_CACHE["triangles"] = []
+        _LIVE_PROXY_CACHE["lines"] = []
+        return [], []
+
+    primary_mesh = bpy.data.objects.get(settings.control_edit_mesh_name)
+    if primary_mesh is None:
+        primary_mesh = settings.target_mesh
+    if primary_mesh is None or primary_mesh.type != 'MESH':
+        return [], []
+    collection_name = str(primary_mesh.get(
+        PROP_COLLECTION,
+        _control_collection_name(settings.prefix, primary_mesh.name),
+    ))
+    collection = bpy.data.collections.get(collection_name)
+    controls = find_control_points(collection, settings.prefix, require_all=True)
+    signature = _live_proxy_signature(settings, primary_mesh, controls)
+    if signature == _LIVE_PROXY_CACHE["signature"]:
+        return _LIVE_PROXY_CACHE["triangles"], _LIVE_PROXY_CACHE["lines"]
+
+    surface_records = []
+    for mesh_obj in _stored_target_meshes(primary_mesh):
+        surface_records.extend(
+            _records_from_indices(mesh_obj, _load_selected_indices(mesh_obj))
+        )
+    if len(surface_records) < 4:
+        return [], []
+    surface_points = [record["world"] for record in surface_records]
+    surface_normals = [record["normal"] for record in surface_records]
+    control_points = _control_world_locations(controls)
+
+    if settings.skirt_shape_mode == 'ASYMMETRIC':
+        base_l3 = _load_asym_base_l3(primary_mesh)
+        samples, _chain_lengths, _hem_profile, _arc_mapping = (
+            build_asymmetric_joint_grid(
+                control_points,
+                surface_points,
+                settings,
+                base_l3,
+            )
+        )
+    else:
+        samples = build_cage_samples(
+            control_points,
+            settings.rows,
+            settings.columns,
+            settings.bone_inset,
+            True,
+            surface_points=surface_points,
+            surface_normals=surface_normals,
+            slice_thickness=settings.slice_thickness,
+            fit_mode=settings.fit_mode,
+            ring_fit_strength=settings.ring_fit_strength,
+            longitudinal_smoothing=settings.longitudinal_smoothing,
+        )
+        samples = _uniform_proxy_row_samples(samples)
+
+    triangles, lines = _proxy_draw_geometry(samples, True)
+    _LIVE_PROXY_CACHE["signature"] = signature
+    _LIVE_PROXY_CACHE["triangles"] = triangles
+    _LIVE_PROXY_CACHE["lines"] = lines
+    return triangles, lines
 
 
 def _draw_control_edit_selection_markers():
-    """Draw green controls and orange fitted target vertices."""
+    """Draw a live proxy, colored control chains and fitted target vertices."""
     try:
-        control_positions = _control_edit_control_world_positions(bpy.context.scene)
-        selection_positions = _control_edit_selected_world_positions(bpy.context.scene)
-        if not control_positions and not selection_positions:
+        scene = bpy.context.scene
+        control_chains = _control_edit_control_world_positions(scene)
+        selection_positions = _control_edit_selected_world_positions(scene)
+        proxy_triangles, proxy_lines = _control_edit_live_proxy_geometry(scene)
+        if not any(control_chains.values()) and not selection_positions and not proxy_lines:
             return
+
         shader = gpu.shader.from_builtin('UNIFORM_COLOR')
         gpu.state.blend_set('ALPHA')
-        gpu.state.depth_test_set('NONE')
         shader.bind()
-        if control_positions:
-            gpu.state.point_size_set(15.0)
-            shader.uniform_float("color", (0.08, 1.0, 0.18, 1.0))
-            batch_for_shader(shader, 'POINTS', {"pos": control_positions}).draw(shader)
+
+        if proxy_triangles:
+            gpu.state.depth_test_set('LESS_EQUAL')
+            shader.uniform_float("color", (0.10, 0.72, 1.0, 0.16))
+            batch_for_shader(
+                shader, 'TRIS', {"pos": proxy_triangles}
+            ).draw(shader)
+        if proxy_lines:
+            gpu.state.depth_test_set('LESS_EQUAL')
+            try:
+                gpu.state.line_width_set(1.5)
+            except (AttributeError, RuntimeError):
+                pass
+            shader.uniform_float("color", (0.15, 0.82, 1.0, 0.82))
+            batch_for_shader(shader, 'LINES', {"pos": proxy_lines}).draw(shader)
+
+        gpu.state.depth_test_set('NONE')
+        gpu.state.point_size_set(15.0)
+        for direction in CONTROL_DIRECTIONS:
+            positions = control_chains.get(direction, [])
+            if not positions:
+                continue
+            color = CONTROL_CHAIN_COLORS[direction]
+            shader.uniform_float("color", color)
+            batch_for_shader(shader, 'POINTS', {"pos": positions}).draw(shader)
+            if len(positions) > 1:
+                chain_lines = []
+                for index in range(len(positions) - 1):
+                    chain_lines.extend((positions[index], positions[index + 1]))
+                batch_for_shader(shader, 'LINES', {"pos": chain_lines}).draw(shader)
         if selection_positions:
             gpu.state.point_size_set(8.0)
             shader.uniform_float("color", (1.0, 0.28, 0.04, 1.0))
-            batch_for_shader(shader, 'POINTS', {"pos": selection_positions}).draw(shader)
-    except (ReferenceError, RuntimeError):
-        # A viewport may be closing while Blender removes a draw handler.
+            batch_for_shader(
+                shader, 'POINTS', {"pos": selection_positions}
+            ).draw(shader)
+    except (ReferenceError, RuntimeError, ValueError, KeyError):
+        # A viewport may be closing or the edit session may be incomplete.
         pass
     finally:
         try:
             gpu.state.point_size_set(1.0)
+            gpu.state.line_width_set(1.0)
             gpu.state.depth_test_set('LESS_EQUAL')
             gpu.state.blend_set('NONE')
-        except RuntimeError:
+        except (AttributeError, RuntimeError):
             pass
-
 
 def _remove_selection_marker_draw_handler():
     global _SELECTION_MARKER_DRAW_HANDLE
@@ -1393,6 +1563,7 @@ def _create_or_update_controls(
             obj.empty_display_size = display_size
             obj.location = controls[direction][level]
             obj.show_in_front = True
+            obj.color = CONTROL_CHAIN_COLORS[direction]
             obj[PROP_TARGET] = mesh_obj.name
             obj[PROP_KIND] = EDIT_KIND_CONTROL
             obj["auto_skirt_direction"] = direction
@@ -4405,6 +4576,11 @@ class AUTOSKIRT_PG_settings(bpy.types.PropertyGroup):
         default=False,
         description="前后控制点沿全局 Y 对称编辑",
     )
+    control_live_proxy_preview: BoolProperty(
+        name="实时显示代理网格",
+        default=True,
+        description="编辑控制点时实时显示最终骨骼环对应的代理表面；仅用于预览",
+    )
     control_edit_snapshot: StringProperty(
         name="控制点编辑快照",
         default="",
@@ -4476,6 +4652,7 @@ class AUTOSKIRT_PT_main(bpy.types.Panel):
             edit_box.label(text="完成 / 取消 / 复原在 3D 视图顶部")
             edit_box.prop(settings, "control_mirror_x", text="X 镜像")
             edit_box.prop(settings, "control_mirror_y", text="Y 镜像")
+            edit_box.prop(settings, "control_live_proxy_preview")
 
         layout.separator()
         layout.operator(

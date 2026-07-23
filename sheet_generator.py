@@ -15,6 +15,12 @@ from mathutils import Vector
 from mathutils.bvhtree import BVHTree
 
 LEVELS = 4
+CONTROL_CHAIN_COLORS = (
+    (1.0, 0.18, 0.08, 1.0),
+    (0.10, 0.90, 0.24, 1.0),
+    (0.10, 0.42, 1.0, 1.0),
+    (0.86, 0.16, 1.0, 1.0),
+)
 EPS = 1.0e-8
 MIN_WEIGHT = 0.001
 PARENT_KEY = "__AUTO_SHEET_PARENT__"
@@ -31,6 +37,11 @@ KIND_PROXY = "SHEET_PROXY"
 
 _DRAW_HANDLE = None
 _MIRROR_GUARD = False
+_LIVE_PROXY_CACHE = {
+    "signature": None,
+    "triangles": [],
+    "lines": [],
+}
 
 
 def clamp(value, minimum=0.0, maximum=1.0):
@@ -418,7 +429,7 @@ def create_controls(primary, settings, region_grids, display_size):
                 obj.empty_display_size = display_size
                 obj.location = grid[row][column]
                 obj.show_in_front = True
-                obj.color = (0.08, 1.0, 0.18, 1.0)
+                obj.color = CONTROL_CHAIN_COLORS[column % len(CONTROL_CHAIN_COLORS)]
                 obj[PROP_KIND] = KIND_CONTROL
                 obj["auto_sheet_target"] = primary.name
                 obj["auto_sheet_region"] = region
@@ -523,6 +534,12 @@ def enter_edit(context, settings, collection=None):
     grids, found_collection = find_controls(primary, settings.prefix, require=True)
     collection = collection or found_collection
     controls = flatten_controls(grids)
+    for grid in grids:
+        for row in range(LEVELS):
+            for column in range(LEVELS):
+                grid[row][column].color = CONTROL_CHAIN_COLORS[
+                    column % len(CONTROL_CHAIN_COLORS)
+                ]
     if not controls:
         raise ValueError("没有可编辑的面片控制点")
     skirt = getattr(context.scene, "auto_skirt_settings", None)
@@ -533,6 +550,7 @@ def enter_edit(context, settings, collection=None):
     settings.edit_last_positions = settings.edit_snapshot
     settings.edit_hide_state = capture_hide_state(context, controls)
     settings.edit_active = True
+    _LIVE_PROXY_CACHE["signature"] = None
     if context.active_object is not None and context.active_object.mode != 'OBJECT':
         bpy.ops.object.mode_set(mode='OBJECT')
     names = {obj.name for obj in controls}
@@ -571,6 +589,9 @@ def leave_edit(context, settings, reset=False):
     settings.edit_snapshot = ""
     settings.edit_last_positions = ""
     settings.edit_hide_state = ""
+    _LIVE_PROXY_CACHE["signature"] = None
+    _LIVE_PROXY_CACHE["triangles"] = []
+    _LIVE_PROXY_CACHE["lines"] = []
     for area in context.screen.areas if context.screen else []:
         area.tag_redraw()
 
@@ -656,6 +677,7 @@ def draw_header(self, context):
     row = layout.row(align=True)
     row.label(text="面片控制点编辑", icon='EMPTY_AXIS')
     row.prop(settings, "local_symmetry", text="局部横向对称")
+    row.prop(settings, "live_proxy_preview", text="实时代理")
     row.operator("auto_sheet.reverse_horizontal", text="反转横向")
     row.operator("auto_sheet.reset_edit", text="复原", icon='LOOP_BACK')
     row.operator("auto_sheet.cancel_edit", text="取消", icon='CANCEL')
@@ -678,7 +700,15 @@ def marker_positions():
     if primary is None:
         return [], []
     grids, _collection = find_controls(primary, settings.prefix, require=False)
-    controls = [obj.matrix_world.translation.copy() for obj in flatten_controls(grids)]
+    control_chains = [
+        [
+            grid[row][column].matrix_world.translation.copy()
+            for row in range(LEVELS)
+            if grid[row][column] is not None
+        ]
+        for grid in grids
+        for column in range(LEVELS)
+    ]
     selected = []
     for mesh_obj in stored_targets(primary):
         try:
@@ -690,36 +720,128 @@ def marker_positions():
             for index in indices
             if 0 <= int(index) < len(mesh_obj.data.vertices)
         )
-    return controls, selected
+    return control_chains, selected
+
+
+def live_proxy_signature(settings, primary, grids):
+    values = [
+        primary.name,
+        settings.group_mode,
+        int(settings.bones_per_chain),
+        int(settings.chains),
+    ]
+    for grid in grids:
+        for row in range(LEVELS):
+            for column in range(LEVELS):
+                point = grid[row][column].matrix_world.translation
+                values.extend(round(float(component), 6) for component in point)
+    return tuple(values)
+
+
+def live_proxy_geometry():
+    """Cache the final open-sheet proxy topology while controls are edited."""
+    settings = getattr(bpy.context.scene, "auto_sheet_settings", None)
+    if settings is None or not settings.edit_active or not settings.live_proxy_preview:
+        _LIVE_PROXY_CACHE["signature"] = None
+        _LIVE_PROXY_CACHE["triangles"] = []
+        _LIVE_PROXY_CACHE["lines"] = []
+        return [], []
+    primary = primary_from_settings(settings)
+    if primary is None:
+        return [], []
+    grids, _collection = find_controls(primary, settings.prefix, require=True)
+    signature = live_proxy_signature(settings, primary, grids)
+    if signature == _LIVE_PROXY_CACHE["signature"]:
+        return _LIVE_PROXY_CACHE["triangles"], _LIVE_PROXY_CACHE["lines"]
+
+    triangles = []
+    lines = []
+    for grid in grids:
+        control_grid = [
+            [obj.matrix_world.translation.copy() for obj in row]
+            for row in grid
+        ]
+        nodes = build_proxy_nodes(
+            control_grid,
+            settings.bones_per_chain,
+            settings.chains,
+        )
+        vertices, faces, _vertex_uv = proxy_topology(nodes, triangulated=False)
+        edges = set()
+        for face in faces:
+            if len(face) >= 3:
+                for offset in range(1, len(face) - 1):
+                    triangles.extend((
+                        vertices[face[0]],
+                        vertices[face[offset]],
+                        vertices[face[offset + 1]],
+                    ))
+            for offset, first in enumerate(face):
+                second = face[(offset + 1) % len(face)]
+                edges.add(tuple(sorted((int(first), int(second)))))
+        for first, second in edges:
+            lines.extend((vertices[first], vertices[second]))
+
+    _LIVE_PROXY_CACHE["signature"] = signature
+    _LIVE_PROXY_CACHE["triangles"] = triangles
+    _LIVE_PROXY_CACHE["lines"] = lines
+    return triangles, lines
 
 
 def draw_markers():
     try:
-        controls, selected = marker_positions()
-        if not controls and not selected:
+        control_chains, selected = marker_positions()
+        proxy_triangles, proxy_lines = live_proxy_geometry()
+        if not control_chains and not selected and not proxy_lines:
             return
         shader = gpu.shader.from_builtin('UNIFORM_COLOR')
         gpu.state.blend_set('ALPHA')
-        gpu.state.depth_test_set('NONE')
         shader.bind()
-        if controls:
-            gpu.state.point_size_set(15.0)
-            shader.uniform_float("color", (0.08, 1.0, 0.18, 1.0))
-            batch_for_shader(shader, 'POINTS', {"pos": controls}).draw(shader)
+
+        if proxy_triangles:
+            gpu.state.depth_test_set('LESS_EQUAL')
+            shader.uniform_float("color", (0.10, 0.72, 1.0, 0.16))
+            batch_for_shader(
+                shader, 'TRIS', {"pos": proxy_triangles}
+            ).draw(shader)
+        if proxy_lines:
+            gpu.state.depth_test_set('LESS_EQUAL')
+            try:
+                gpu.state.line_width_set(1.5)
+            except (AttributeError, RuntimeError):
+                pass
+            shader.uniform_float("color", (0.15, 0.82, 1.0, 0.82))
+            batch_for_shader(shader, 'LINES', {"pos": proxy_lines}).draw(shader)
+
+        gpu.state.depth_test_set('NONE')
+        gpu.state.point_size_set(15.0)
+        for chain_index, positions in enumerate(control_chains):
+            if not positions:
+                continue
+            color = CONTROL_CHAIN_COLORS[
+                chain_index % len(CONTROL_CHAIN_COLORS)
+            ]
+            shader.uniform_float("color", color)
+            batch_for_shader(shader, 'POINTS', {"pos": positions}).draw(shader)
+            if len(positions) > 1:
+                chain_lines = []
+                for index in range(len(positions) - 1):
+                    chain_lines.extend((positions[index], positions[index + 1]))
+                batch_for_shader(shader, 'LINES', {"pos": chain_lines}).draw(shader)
         if selected:
             gpu.state.point_size_set(8.0)
             shader.uniform_float("color", (1.0, 0.28, 0.04, 1.0))
             batch_for_shader(shader, 'POINTS', {"pos": selected}).draw(shader)
-    except (ReferenceError, RuntimeError, ValueError):
+    except (ReferenceError, RuntimeError, ValueError, KeyError):
         pass
     finally:
         try:
             gpu.state.point_size_set(1.0)
+            gpu.state.line_width_set(1.0)
             gpu.state.depth_test_set('LESS_EQUAL')
             gpu.state.blend_set('NONE')
-        except RuntimeError:
+        except (AttributeError, RuntimeError):
             pass
-
 
 def install_draw_handler():
     global _DRAW_HANDLE
@@ -1403,6 +1525,11 @@ class AUTOSHEET_PG_settings(bpy.types.PropertyGroup):
     bones_per_chain: IntProperty(name="每链骨骼数", default=6, min=1, max=128)
     chains: IntProperty(name="骨骼链数", default=8, min=2, max=256)
     create_proxy_mesh: BoolProperty(name="生成代理网格", default=False)
+    live_proxy_preview: BoolProperty(
+        name="实时显示代理网格",
+        default=True,
+        description="编辑面片控制点时实时显示最终代理表面；仅用于预览",
+    )
     flip_bone_axis: BoolProperty(
         name="翻转骨骼轴向",
         default=False,
@@ -1619,6 +1746,7 @@ class AUTOSHEET_PT_main(bpy.types.Panel):
             editing = layout.box()
             editing.label(text="正在编辑面片控制点", icon='EMPTY_AXIS')
             editing.prop(settings, "local_symmetry")
+            editing.prop(settings, "live_proxy_preview")
             editing.prop(settings, "horizontal_reversed")
             editing.label(text="完成 / 取消 / 复原位于 3D 视图顶部")
 
