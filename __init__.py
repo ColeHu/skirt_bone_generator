@@ -4,7 +4,7 @@
 bl_info = {
     "name": "裙子骨骼生成器",
     "author": "Akazure",
-    "version": (1, 4, 0),
+    "version": (1, 5, 2),
     "blender": (4, 5, 0),
     "location": "3D 视图 > 右侧边栏 > 自动裙骨",
     "description": "根据控制点生成裙子骨骼",
@@ -35,11 +35,23 @@ from mathutils.bvhtree import BVHTree
 
 CONTROL_DIRECTIONS = ("Front", "Right", "Back", "Left")
 CONTROL_LEVELS = 4
+ASYM_CONTROL_CHAIN_COLORS = (
+    (0.78, 1.00, 0.10, 1.0),  # lemon
+    (0.35, 0.95, 0.12, 1.0),  # chartreuse
+    (0.08, 0.88, 0.32, 1.0),  # green
+    (0.05, 0.84, 0.62, 1.0),  # teal
+    (0.05, 0.72, 1.00, 1.0),  # cyan-blue
+    (0.12, 0.42, 1.00, 1.0),  # blue
+    (0.34, 0.24, 1.00, 1.0),  # indigo
+    (0.60, 0.20, 1.00, 1.0),  # violet
+    (0.88, 0.36, 1.00, 1.0),  # orchid
+    (0.92, 0.90, 0.55, 1.0),  # cream
+)
 CONTROL_CHAIN_COLORS = {
-    "Front": (1.0, 0.18, 0.08, 1.0),
-    "Right": (0.10, 0.90, 0.24, 1.0),
-    "Back": (0.10, 0.42, 1.0, 1.0),
-    "Left": (0.86, 0.16, 1.0, 1.0),
+    "Front": ASYM_CONTROL_CHAIN_COLORS[0],
+    "Right": ASYM_CONTROL_CHAIN_COLORS[2],
+    "Back": ASYM_CONTROL_CHAIN_COLORS[5],
+    "Left": ASYM_CONTROL_CHAIN_COLORS[7],
 }
 EPSILON = 1.0e-8
 MIN_WEIGHT = 0.001
@@ -59,6 +71,8 @@ PROP_TARGETS = "auto_skirt_target_meshes"
 PROP_KIND = "auto_skirt_generated_kind"
 PROP_SHAPE_MODE = "auto_skirt_shape_mode"
 PROP_ASYM_BASE_L3 = "auto_skirt_asym_base_l3"
+PROP_ASYM_CONTROL_CHAINS = "auto_skirt_asym_control_chains"
+PROP_ASYM_BONE_COUNTS = "auto_skirt_asym_bone_counts"
 
 PROP_PROXY_KIND = "PROXY"
 EDIT_KIND_CONTROL = "CONTROL"
@@ -67,6 +81,7 @@ _MIRROR_GUARD = False
 _LR_SUFFIX_NAMING_ENABLED = False
 _LR_SUFFIX_COLUMN_MAP = {}
 _SELECTION_MARKER_DRAW_HANDLE = None
+_ASYM_CONTROL_RESAMPLE_GUARD = False
 _LIVE_PROXY_CACHE = {
     "signature": None,
     "triangles": [],
@@ -116,6 +131,21 @@ def _proxy_collection_name(prefix, mesh_name):
 
 def _control_name(prefix, direction, level):
     return f"{prefix}CTRL_{direction}_L{level}"
+
+
+def _asym_control_name(prefix, chain, level):
+    return f"{prefix}CTRL_C{int(chain):02d}_L{int(level)}"
+
+
+def _asym_control_color(chain):
+    return ASYM_CONTROL_CHAIN_COLORS[
+        int(chain) % len(ASYM_CONTROL_CHAIN_COLORS)
+    ]
+
+
+def _plain_bone_name(prefix, column, row):
+    """Bone name used by asymmetric skirts; .L/.R is deliberately disabled."""
+    return f"{prefix}C{int(column):02d}_R{int(row):02d}"
 
 
 def _column_average(samples, column):
@@ -459,6 +489,43 @@ def _load_asym_base_l3(mesh_obj):
                 pass
     return result
 
+def _asym_count_property_name(chain):
+    return f"asym_chain_bones_{int(chain):02d}"
+
+
+def _get_asym_anchor_bone_counts(settings, chain_count=None):
+    count = int(chain_count if chain_count is not None else settings.asym_control_chain_count)
+    return [
+        clamp(int(getattr(settings, _asym_count_property_name(chain))), 1, 64)
+        for chain in range(count)
+    ]
+
+
+def _set_asym_anchor_bone_counts(settings, values, chain_count=None):
+    count = int(chain_count if chain_count is not None else settings.asym_control_chain_count)
+    values = list(values)
+    fallback = clamp(int(settings.asym_default_bone_count), 1, 64)
+    for chain in range(count):
+        value = values[chain] if chain < len(values) else fallback
+        setattr(
+            settings,
+            _asym_count_property_name(chain),
+            int(clamp(round(float(value)), 1, 64)),
+        )
+
+
+def _load_stored_asym_bone_counts(mesh_obj, fallback=None):
+    try:
+        values = json.loads(mesh_obj.get(PROP_ASYM_BONE_COUNTS, "[]"))
+    except (TypeError, json.JSONDecodeError):
+        values = []
+    result = [
+        int(clamp(round(float(value)), 1, 64))
+        for value in values
+        if isinstance(value, (int, float))
+    ]
+    return result or list(fallback or [])
+
 def _store_mesh_metadata(mesh_obj, settings, collection_name, target_meshes=None):
     mesh_obj[PROP_COLLECTION] = collection_name
     mesh_obj[PROP_ARMATURE] = (
@@ -470,6 +537,12 @@ def _store_mesh_metadata(mesh_obj, settings, collection_name, target_meshes=None
     mesh_obj[PROP_COLUMNS] = settings.columns
     mesh_obj[PROP_BONE_COLLECTION] = settings.bone_collection
     mesh_obj[PROP_SHAPE_MODE] = settings.skirt_shape_mode
+    if settings.skirt_shape_mode == 'ASYMMETRIC':
+        mesh_obj[PROP_ASYM_CONTROL_CHAINS] = int(settings.asym_control_chain_count)
+        mesh_obj[PROP_ASYM_BONE_COUNTS] = json.dumps(
+            _get_asym_anchor_bone_counts(settings),
+            separators=(",", ":"),
+        )
     if target_meshes is not None:
         mesh_obj[PROP_TARGETS] = json.dumps(
             [obj.name for obj in target_meshes if obj is not None and obj.type == 'MESH'],
@@ -570,13 +643,37 @@ def _delete_proxy_objects(prefix, mesh_name):
 # ---------------------------------------------------------------------------
 
 
+def _controls_are_asymmetric(control_objects):
+    return isinstance(control_objects, (list, tuple))
+
+
 def _flatten_control_objects(control_objects):
+    if _controls_are_asymmetric(control_objects):
+        return [
+            obj
+            for chain in control_objects
+            for obj in chain
+            if obj is not None
+        ]
     return [
         control_objects[direction][level]
         for direction in CONTROL_DIRECTIONS
         for level in range(CONTROL_LEVELS)
         if control_objects[direction][level] is not None
     ]
+
+
+def _apply_control_colors(control_objects):
+    if _controls_are_asymmetric(control_objects):
+        for chain, objects in enumerate(control_objects):
+            for obj in objects:
+                if obj is not None:
+                    obj.color = _asym_control_color(chain)
+        return
+    for direction in CONTROL_DIRECTIONS:
+        for obj in control_objects[direction]:
+            if obj is not None:
+                obj.color = CONTROL_CHAIN_COLORS[direction]
 
 
 def _control_position_map(control_objects):
@@ -638,9 +735,7 @@ def _control_edit_collection(context, settings):
     if collection is None:
         raise ValueError("找不到控制点集合，请先生成控制点")
     controls = find_control_points(collection, settings.prefix, require_all=True)
-    for direction in CONTROL_DIRECTIONS:
-        for obj in controls[direction]:
-            obj.color = CONTROL_CHAIN_COLORS[direction]
+    _apply_control_colors(controls)
     return mesh_obj, collection, controls
 
 
@@ -648,22 +743,17 @@ def _snapshot_control_centers(snapshot_raw):
     data = _parse_json_dict(snapshot_raw)
     centers = []
     for level in range(CONTROL_LEVELS):
-        points = []
-        for direction in CONTROL_DIRECTIONS:
-            name = _control_name("AutoSkirt_", direction, level)
-            suffix = f"CTRL_{direction}_L{level}"
-            value = data.get(name)
-            if value is None:
-                for key, candidate in data.items():
-                    if str(key).endswith(suffix):
-                        value = candidate
-                        break
-            point = _vector_from_json(value)
-            if point is not None:
-                points.append(point)
-        centers.append(_average_points(points) if points else Vector((0.0, 0.0, 0.0)))
+        suffix = f"_L{level}"
+        points = [
+            point
+            for key, value in data.items()
+            if "CTRL_" in str(key) and str(key).endswith(suffix)
+            if (point := _vector_from_json(value)) is not None
+        ]
+        centers.append(
+            _average_points(points) if points else Vector((0.0, 0.0, 0.0))
+        )
     return centers
-
 
 def _restore_control_positions(control_objects, snapshot_raw):
     data = _parse_json_dict(snapshot_raw)
@@ -847,6 +937,94 @@ def _apply_mirror_pair(control_objects, current, changed, active_name, direction
     return True
 
 
+def _dynamic_mirror_pairs(control_objects, snapshot_raw, level, axis):
+    snapshot = _parse_json_dict(snapshot_raw)
+    points = {}
+    for chain, objects in enumerate(control_objects):
+        point = _vector_from_json(snapshot.get(objects[level].name))
+        if point is not None:
+            points[chain] = point
+    if not points:
+        return [], 0.0
+    center = _average_points(points.values())
+    center_value = center.x if axis == 'X' else center.y
+    unpaired = set(points)
+    pairs = []
+    if len(unpaired) % 2:
+        self_chain = min(
+            unpaired,
+            key=lambda chain: abs(
+                (points[chain].x if axis == 'X' else points[chain].y)
+                - center_value
+            ),
+        )
+        pairs.append((self_chain, self_chain))
+        unpaired.remove(self_chain)
+    while unpaired:
+        first = min(unpaired)
+        unpaired.remove(first)
+        reflected = _mirror_location(points[first], axis, center_value)
+        second = min(
+            unpaired,
+            key=lambda chain: (points[chain] - reflected).length_squared,
+        )
+        unpaired.remove(second)
+        pairs.append((first, second))
+    return pairs, center_value
+
+
+def _apply_dynamic_mirror_axis(
+    control_objects,
+    current,
+    changed,
+    active_name,
+    level,
+    axis,
+    snapshot_raw,
+):
+    mirrored_names = set()
+    pairs, center_value = _dynamic_mirror_pairs(
+        control_objects, snapshot_raw, level, axis
+    )
+    for first, second in pairs:
+        obj_a = control_objects[first][level]
+        obj_b = control_objects[second][level]
+        if first == second:
+            if obj_a.name not in changed:
+                continue
+            obj_a.location = _mirror_location(
+                obj_a.location,
+                axis,
+                center_value,
+            ).lerp(obj_a.location, 0.5)
+            if axis == 'X':
+                obj_a.location.x = center_value
+            else:
+                obj_a.location.y = center_value
+            current[obj_a.name] = list(obj_a.location)
+            mirrored_names.add(obj_a.name)
+            continue
+        source_name, target_name = _choose_mirror_source(
+            obj_a.name,
+            obj_b.name,
+            changed,
+            active_name,
+        )
+        if source_name is None:
+            continue
+        source_obj = bpy.data.objects.get(source_name)
+        target_obj = bpy.data.objects.get(target_name)
+        if source_obj is None or target_obj is None:
+            continue
+        target_obj.location = _mirror_location(
+            source_obj.location,
+            axis,
+            center_value,
+        )
+        current[target_obj.name] = list(target_obj.location)
+        mirrored_names.add(target_obj.name)
+    return mirrored_names
+
 def _apply_control_edit_mirror(context):
     global _MIRROR_GUARD
     if _MIRROR_GUARD:
@@ -875,6 +1053,34 @@ def _apply_control_edit_mirror(context):
     active_name = context.active_object.name if context.active_object else ""
     _MIRROR_GUARD = True
     try:
+        if _controls_are_asymmetric(controls):
+            for level in range(CONTROL_LEVELS):
+                if settings.control_mirror_x:
+                    changed.update(_apply_dynamic_mirror_axis(
+                        controls,
+                        current,
+                        changed,
+                        active_name,
+                        level,
+                        'X',
+                        settings.control_edit_snapshot,
+                    ))
+                if settings.control_mirror_y:
+                    changed.update(_apply_dynamic_mirror_axis(
+                        controls,
+                        current,
+                        changed,
+                        active_name,
+                        level,
+                        'Y',
+                        settings.control_edit_snapshot,
+                    ))
+            settings.control_edit_last_positions = json.dumps(
+                _control_position_map(controls),
+                separators=(",", ":"),
+            )
+            return
+
         any_changed = False
         for level in range(CONTROL_LEVELS):
             center = centers[level]
@@ -981,6 +1187,15 @@ def _control_edit_control_world_positions(scene):
     ))
     collection = bpy.data.collections.get(collection_name)
     controls = find_control_points(collection, settings.prefix, require_all=False)
+    if _controls_are_asymmetric(controls):
+        return {
+            f"C{chain:02d}": [
+                obj.matrix_world.translation.copy()
+                for obj in objects
+                if obj is not None
+            ]
+            for chain, objects in enumerate(controls)
+        }
     return {
         direction: [
             obj.matrix_world.translation.copy()
@@ -1029,10 +1244,21 @@ def _live_proxy_signature(settings, primary_mesh, controls):
         round(float(settings.ring_fit_strength), 6),
         bool(settings.longitudinal_smoothing),
     ]
-    for direction in CONTROL_DIRECTIONS:
-        for obj in controls[direction]:
-            point = obj.matrix_world.translation
-            values.extend(round(float(component), 6) for component in point)
+    if _controls_are_asymmetric(controls):
+        values.append(int(settings.asym_control_chain_count))
+        values.extend(_get_asym_anchor_bone_counts(
+            settings,
+            len(controls),
+        ))
+        for chain in controls:
+            for obj in chain:
+                point = obj.matrix_world.translation
+                values.extend(round(float(component), 6) for component in point)
+    else:
+        for direction in CONTROL_DIRECTIONS:
+            for obj in controls[direction]:
+                point = obj.matrix_world.translation
+                values.extend(round(float(component), 6) for component in point)
     return tuple(values)
 
 
@@ -1076,15 +1302,15 @@ def _control_edit_live_proxy_geometry(scene):
     control_points = _control_world_locations(controls)
 
     if settings.skirt_shape_mode == 'ASYMMETRIC':
-        base_l3 = _load_asym_base_l3(primary_mesh)
-        samples, _chain_lengths, _hem_profile, _arc_mapping = (
-            build_asymmetric_joint_grid(
-                control_points,
-                surface_points,
-                settings,
-                base_l3,
-            )
+        if not _controls_are_asymmetric(control_points):
+            raise ValueError("旧版不对称控制点不兼容，请重新生成控制点")
+        preview_data = build_variable_asymmetric_data(
+            control_points,
+            surface_points,
+            settings,
+            _get_asym_anchor_bone_counts(settings, len(control_points)),
         )
+        samples = preview_data["preview_grid"]
     else:
         samples = build_cage_samples(
             control_points,
@@ -1139,11 +1365,14 @@ def _draw_control_edit_selection_markers():
 
         gpu.state.depth_test_set('NONE')
         gpu.state.point_size_set(15.0)
-        for direction in CONTROL_DIRECTIONS:
-            positions = control_chains.get(direction, [])
+        for chain_key, positions in control_chains.items():
             if not positions:
                 continue
-            color = CONTROL_CHAIN_COLORS[direction]
+            color = (
+                _asym_control_color(int(chain_key[1:]))
+                if chain_key.startswith("C")
+                else CONTROL_CHAIN_COLORS[chain_key]
+            )
             shader.uniform_float("color", color)
             batch_for_shader(shader, 'POINTS', {"pos": positions}).draw(shader)
             if len(positions) > 1:
@@ -1180,6 +1409,7 @@ def _remove_selection_marker_draw_handler():
         except (ReferenceError, RuntimeError):
             pass
         _SELECTION_MARKER_DRAW_HANDLE = None
+_ASYM_CONTROL_RESAMPLE_GUARD = False
 
 
 def _install_selection_marker_draw_handler():
@@ -1452,6 +1682,236 @@ def _profile_point_at(profile, raw_u):
     )
 
 
+def _profile_horizontal_sector_data(
+    profile,
+    chain_count,
+    samples_per_sector=64,
+):
+    """Measure the selected hem envelope in top view for chain allocation."""
+    up = _safe_normalized(profile["up"], Vector((0.0, 0.0, 1.0)))
+    sectors = []
+    for sector in range(chain_count):
+        cumulative = [0.0]
+        previous = _profile_point_at(profile, sector / chain_count)
+        for step in range(1, samples_per_sector + 1):
+            raw_u = (sector + step / samples_per_sector) / chain_count
+            current = _profile_point_at(profile, raw_u)
+            delta = current - previous
+            horizontal = delta - up * delta.dot(up)
+            cumulative.append(cumulative[-1] + max(horizontal.length, EPSILON))
+            previous = current
+        sectors.append({
+            "cumulative": cumulative,
+            "length": cumulative[-1],
+            "samples": samples_per_sector,
+        })
+    return sectors
+
+
+def _build_profile_arc_mapping(profile, resolution=256):
+    """Map polar angle to horizontal outer-envelope arc length."""
+    resolution = max(int(resolution), 64)
+    up = _safe_normalized(profile["up"], Vector((0.0, 0.0, 1.0)))
+    cumulative = [0.0]
+    previous = _profile_point_at(profile, 0.0)
+    for sample in range(1, resolution + 1):
+        current = _profile_point_at(profile, sample / resolution)
+        delta = current - previous
+        horizontal = delta - up * delta.dot(up)
+        cumulative.append(cumulative[-1] + max(horizontal.length, EPSILON))
+        previous = current
+    return {
+        "resolution": resolution,
+        "cumulative": cumulative,
+        "total": cumulative[-1],
+    }
+
+
+def _build_point_cloud_average_arc_mapping(
+    surface_points,
+    control_points,
+    profile,
+    resolution=256,
+    level_count=8,
+):
+    """Measure average horizontal perimeter from waist to hem.
+
+    Hem-only arc sampling clusters chains around a large lobe and leaves the
+    waist crowded. Averaging several fitted slices keeps spacing balanced over
+    the complete proxy surface.
+    """
+    resolution = max(int(resolution), 64)
+    level_count = max(int(level_count), 4)
+    center = Vector(profile["center"])
+    up = _safe_normalized(profile["up"], Vector((0.0, 0.0, 1.0)))
+    right = profile["right"]
+    back = profile["back"]
+    raw_parameters = []
+    rail_cache = {}
+    rail_resolution = max(resolution, 128)
+    for point in surface_points:
+        point = Vector(point)
+        raw_u = _raw_skirt_u(point, center, right, back)
+        cache_index = int(round(raw_u * rail_resolution)) % rail_resolution
+        if cache_index not in rail_cache:
+            cached_u = cache_index / rail_resolution
+            rail_cache[cache_index] = [
+                _variable_asym_surface_point(
+                    control_points,
+                    cached_u,
+                    step / 48.0,
+                )
+                for step in range(49)
+            ]
+        raw_parameters.append((
+            raw_u,
+            _closest_polyline_parameter(point, rail_cache[cache_index]),
+        ))
+
+    rings = []
+    angular_band = max(2.5 / resolution, 0.035)
+    for level in range(level_count):
+        local_v = level / (level_count - 1)
+        slice_center = _average_points([
+            _variable_asym_surface_point(
+                control_points,
+                sample / max(resolution // 4, 32),
+                local_v,
+            )
+            for sample in range(max(resolution // 4, 32))
+        ])
+        ring = []
+        for sample in range(resolution):
+            raw_u = sample / resolution
+            radial = _radial_at_u(raw_u, right, back)
+            v_band = 0.08
+            candidates = []
+            for _attempt in range(5):
+                candidates = [
+                    index
+                    for index, (point_u, point_v) in enumerate(raw_parameters)
+                    if _circular_distance(point_u, raw_u) <= angular_band
+                    and abs(point_v - local_v) <= v_band
+                ]
+                if len(candidates) >= 4:
+                    break
+                v_band = min(v_band * 1.7, 0.5)
+            if not candidates:
+                candidates = sorted(
+                    range(len(surface_points)),
+                    key=lambda index: (
+                        _circular_distance(raw_parameters[index][0], raw_u)
+                        + abs(raw_parameters[index][1] - local_v)
+                    ),
+                )[:min(8, len(surface_points))]
+
+            radii = []
+            for index in candidates:
+                delta = Vector(surface_points[index]) - slice_center
+                horizontal = delta - up * delta.dot(up)
+                if horizontal.length_squared <= EPSILON:
+                    continue
+                direction_score = horizontal.normalized().dot(radial)
+                if direction_score <= 0.10:
+                    continue
+                radius = horizontal.dot(radial)
+                if radius > 0.0:
+                    radii.append(radius)
+            if radii:
+                radii.sort(reverse=True)
+                outer = radii[:min(5, len(radii))]
+                radius = max(sum(outer) / len(outer), outer[0] * 0.985)
+            else:
+                target = _variable_asym_surface_point(
+                    control_points,
+                    raw_u,
+                    local_v,
+                )
+                delta = target - slice_center
+                horizontal = delta - up * delta.dot(up)
+                radius = horizontal.length
+            axis_point = slice_center + up * (
+                _variable_asym_surface_point(
+                    control_points,
+                    raw_u,
+                    local_v,
+                ) - slice_center
+            ).dot(up)
+            ring.append(axis_point + radial * max(radius, EPSILON))
+        rings.append(ring)
+
+    cumulative = [0.0]
+    for sample in range(resolution):
+        following = (sample + 1) % resolution
+        length = 0.0
+        for ring in rings:
+            delta = ring[following] - ring[sample]
+            horizontal = delta - up * delta.dot(up)
+            length += horizontal.length
+        cumulative.append(
+            cumulative[-1] + max(length / len(rings), EPSILON)
+        )
+    return {
+        "resolution": resolution,
+        "cumulative": cumulative,
+        "total": cumulative[-1],
+    }
+
+
+def _build_fitted_chain_arc_mapping(
+    raw_us,
+    dense_chains,
+    up,
+    resolution=256,
+):
+    """Build a correction map from measured final chain-to-chain spacing."""
+    count = len(raw_us)
+    if count < 3 or len(dense_chains) != count:
+        return None
+    up = _safe_normalized(up, Vector((0.0, 0.0, 1.0)))
+    segment_lengths = []
+    for column in range(count):
+        following = (column + 1) % count
+        values = []
+        for first, second in zip(
+            dense_chains[column],
+            dense_chains[following],
+        ):
+            delta = Vector(second) - Vector(first)
+            horizontal = delta - up * delta.dot(up)
+            values.append(horizontal.length)
+        segment_lengths.append(max(
+            sum(values) / max(len(values), 1),
+            EPSILON,
+        ))
+
+    starts = [float(value) % 1.0 for value in raw_us]
+    accumulated = [0.0]
+    for length in segment_lengths:
+        accumulated.append(accumulated[-1] + length)
+    total = accumulated[-1]
+    resolution = max(int(resolution), 64)
+    cumulative = []
+    segment = 0
+    for sample in range(resolution + 1):
+        raw_u = sample / resolution
+        while segment + 1 < count and raw_u >= starts[segment + 1]:
+            segment += 1
+        first_u = starts[segment]
+        following_u = starts[segment + 1] if segment + 1 < count else 1.0
+        span = max(following_u - first_u, EPSILON)
+        factor = clamp((raw_u - first_u) / span, 0.0, 1.0)
+        cumulative.append(
+            accumulated[segment] + segment_lengths[segment] * factor
+        )
+    cumulative[-1] = total
+    return {
+        "resolution": resolution,
+        "cumulative": cumulative,
+        "total": total,
+    }
+
+
 def _fit_asymmetric_control_positions(records, armature_obj):
     standard, display_size = _fit_control_positions(records, armature_obj)
     profile = _fit_smooth_hem_profile(records, armature_obj)
@@ -1524,6 +1984,137 @@ def _fit_asymmetric_control_positions(records, armature_obj):
         controls[direction] = direction_points
 
     return controls, display_size, profile
+
+def _fit_variable_asymmetric_control_positions(
+    records,
+    armature_obj,
+    chain_count,
+    bone_inset=0.05,
+):
+    """Create an easy-to-edit circumscribed circular asymmetric cage.
+
+    All chains share one horizontal outer radius. Their L3 heights still
+    follow the fitted hem, so an asymmetric skirt keeps useful initial chain
+    lengths while the top view remains a regular circle.
+    """
+    chain_count = int(clamp(chain_count, 4, 10))
+    profile = _fit_smooth_hem_profile(records, armature_obj)
+    points = [item["world"].copy() for item in records]
+    center = Vector(profile["center"])
+    up = _safe_normalized(profile["up"], Vector((0.0, 0.0, 1.0)))
+    right = profile["right"]
+    back = profile["back"]
+    heights = [point.dot(up) for point in points]
+    top_height = max(heights)
+    bottom_height = min(heights)
+    height_span = max(top_height - bottom_height, EPSILON)
+
+    horizontal_radii = []
+    for point in points:
+        delta = point - center
+        horizontal = delta - up * delta.dot(up)
+        horizontal_radii.append(horizontal.length)
+    source_radius = max(max(horizontal_radii, default=0.0), height_span * 0.02)
+
+    # Compensate the generated cage for Bone Inset. Its usable inner limit
+    # remains slightly outside the selected point cloud instead of clipping it.
+    inset_scale = max(1.0 - clamp(float(bone_inset), 0.0, 0.95), 0.05)
+    cage_radius = source_radius * 1.08 / inset_scale
+
+    controls = []
+    for chain in range(chain_count):
+        raw_u = chain / chain_count
+        radial = _radial_at_u(raw_u, right, back)
+        bottom_height_at_chain = _profile_point_at(profile, raw_u).dot(up)
+        chain_points = []
+        for level in range(CONTROL_LEVELS):
+            local_v = level / (CONTROL_LEVELS - 1)
+            height = _lerp_float(
+                top_height,
+                bottom_height_at_chain,
+                local_v,
+            )
+            axis_point = center + up * (height - center.dot(up))
+            chain_points.append(axis_point + radial * cage_radius)
+        controls.append(chain_points)
+
+    display_size = max(
+        cage_radius * 0.04,
+        height_span * 0.015,
+        0.001,
+    )
+    return controls, display_size, profile
+
+def _create_or_update_asymmetric_controls(
+    mesh_obj,
+    settings,
+    controls,
+    display_size,
+    update_existing=False,
+):
+    collection_name = _control_collection_name(settings.prefix, mesh_obj.name)
+    collection = get_or_create_collection(collection_name)
+    existing = find_control_points(collection, settings.prefix, require_all=False)
+    if update_existing and (
+        not _controls_are_asymmetric(existing)
+        or len(existing) != len(controls)
+        or any(obj is None for chain in existing for obj in chain)
+    ):
+        raise ValueError(
+            "当前不对称控制链数量或拓扑不一致，请重新生成控制点"
+        )
+
+    for chain, chain_points in enumerate(controls):
+        for level in range(CONTROL_LEVELS):
+            name = _asym_control_name(settings.prefix, chain, level)
+            obj = bpy.data.objects.get(name)
+            if obj is None or obj.get(PROP_TARGET) != mesh_obj.name:
+                obj = bpy.data.objects.new(name, None)
+                collection.objects.link(obj)
+            elif collection.objects.get(obj.name) is None:
+                collection.objects.link(obj)
+            obj.empty_display_type = 'SPHERE'
+            obj.empty_display_size = display_size
+            obj.location = Vector(chain_points[level])
+            obj.show_in_front = True
+            obj.color = _asym_control_color(chain)
+            obj[PROP_TARGET] = mesh_obj.name
+            obj[PROP_KIND] = EDIT_KIND_CONTROL
+            obj["auto_skirt_chain_index"] = chain
+            obj["auto_skirt_level"] = level
+            _set_control_object_locked(obj, True)
+
+    _store_mesh_metadata(mesh_obj, settings, collection_name)
+    return collection
+
+
+def _asym_chain_arc_length(chain_points, samples=65):
+    points = [
+        interpolate_vertical_control(
+            chain_points,
+            sample / (samples - 1),
+        )
+        for sample in range(samples)
+    ]
+    return sum(
+        (points[index + 1] - points[index]).length
+        for index in range(len(points) - 1)
+    )
+
+
+def _auto_asym_anchor_bone_counts(settings, control_points):
+    lengths = [_asym_chain_arc_length(chain) for chain in control_points]
+    average_length = sum(lengths) / len(lengths) if lengths else 0.0
+    default_count = int(clamp(settings.asym_default_bone_count, 1, 64))
+    if average_length <= EPSILON:
+        counts = [default_count] * len(control_points)
+    else:
+        counts = [
+            int(clamp(round(default_count * length / average_length), 1, 64))
+            for length in lengths
+        ]
+    _set_asym_anchor_bone_counts(settings, counts, len(control_points))
+    return counts
 
 def _create_or_update_controls(
     mesh_obj,
@@ -1603,19 +2194,38 @@ def generate_control_points(context, settings):
         delete_generated_controls(settings.prefix, primary_mesh.name)
 
     if settings.skirt_shape_mode == 'ASYMMETRIC':
-        controls, display_size, _profile = _fit_asymmetric_control_positions(
-            combined_records, settings.target_armature
+        controls, display_size, _profile = (
+            _fit_variable_asymmetric_control_positions(
+                combined_records,
+                settings.target_armature,
+                settings.asym_control_chain_count,
+                settings.bone_inset,
+            )
         )
-        _store_asym_base_l3(primary_mesh, controls)
+        _auto_asym_anchor_bone_counts(settings, controls)
+        settings.columns = max(settings.columns, len(controls))
+        collection = _create_or_update_asymmetric_controls(
+            primary_mesh,
+            settings,
+            controls,
+            display_size,
+            update_existing=False,
+        )
+        if PROP_ASYM_BASE_L3 in primary_mesh:
+            del primary_mesh[PROP_ASYM_BASE_L3]
     else:
         controls, display_size = _fit_control_positions(
             combined_records, settings.target_armature
         )
         if PROP_ASYM_BASE_L3 in primary_mesh:
             del primary_mesh[PROP_ASYM_BASE_L3]
-    collection = _create_or_update_controls(
-        primary_mesh, settings, controls, display_size, update_existing=False
-    )
+        collection = _create_or_update_controls(
+            primary_mesh,
+            settings,
+            controls,
+            display_size,
+            update_existing=False,
+        )
     for mesh_obj, records in records_by_mesh:
         _store_selection_records(mesh_obj, records)
         _store_mesh_metadata(mesh_obj, settings, collection.name, mesh_objects)
@@ -1656,19 +2266,35 @@ def _refit_control_points(context, settings):
     find_control_points(collection, settings.prefix, require_all=True)
 
     if settings.skirt_shape_mode == 'ASYMMETRIC':
-        controls, display_size, _profile = _fit_asymmetric_control_positions(
-            combined_records, settings.target_armature
+        controls, display_size, _profile = (
+            _fit_variable_asymmetric_control_positions(
+                combined_records,
+                settings.target_armature,
+                settings.asym_control_chain_count,
+                settings.bone_inset,
+            )
         )
-        _store_asym_base_l3(primary_mesh, controls)
+        _auto_asym_anchor_bone_counts(settings, controls)
+        _create_or_update_asymmetric_controls(
+            primary_mesh,
+            settings,
+            controls,
+            display_size,
+            update_existing=True,
+        )
     else:
         controls, display_size = _fit_control_positions(
             combined_records, settings.target_armature
         )
         if PROP_ASYM_BASE_L3 in primary_mesh:
             del primary_mesh[PROP_ASYM_BASE_L3]
-    _create_or_update_controls(
-        primary_mesh, settings, controls, display_size, update_existing=True
-    )
+        _create_or_update_controls(
+            primary_mesh,
+            settings,
+            controls,
+            display_size,
+            update_existing=True,
+        )
     for mesh_obj, records in records_by_mesh:
         _store_selection_records(mesh_obj, records)
         _store_mesh_metadata(mesh_obj, settings, collection.name, mesh_objects)
@@ -1676,6 +2302,38 @@ def _refit_control_points(context, settings):
 
 
 def find_control_points(collection, prefix, require_all=True):
+    dynamic = []
+    if collection is not None:
+        dynamic = [
+            obj for obj in collection.objects
+            if obj.type == 'EMPTY'
+            and obj.get(PROP_KIND) == EDIT_KIND_CONTROL
+            and obj.name.startswith(f"{prefix}CTRL_C")
+            and int(obj.get("auto_skirt_chain_index", -1)) >= 0
+        ]
+    if dynamic:
+        chain_count = max(
+            int(obj.get("auto_skirt_chain_index", -1)) for obj in dynamic
+        ) + 1
+        result = [[None] * CONTROL_LEVELS for _chain in range(chain_count)]
+        for obj in dynamic:
+            chain = int(obj.get("auto_skirt_chain_index", -1))
+            level = int(obj.get("auto_skirt_level", -1))
+            if 0 <= chain < chain_count and 0 <= level < CONTROL_LEVELS:
+                result[chain][level] = obj
+        missing = [
+            _asym_control_name(prefix, chain, level)
+            for chain in range(chain_count)
+            for level in range(CONTROL_LEVELS)
+            if result[chain][level] is None
+        ]
+        if require_all and missing:
+            raise ValueError(
+                f"不对称控制点不完整（需要 {chain_count * CONTROL_LEVELS} 个）；缺少："
+                + ", ".join(missing[:6])
+            )
+        return result
+
     result = {direction: [None] * CONTROL_LEVELS for direction in CONTROL_DIRECTIONS}
     missing = []
     for direction in CONTROL_DIRECTIONS:
@@ -1694,14 +2352,18 @@ def find_control_points(collection, prefix, require_all=True):
 
 
 def _control_world_locations(control_objects):
-    result = {}
-    for direction in CONTROL_DIRECTIONS:
-        result[direction] = [
+    if _controls_are_asymmetric(control_objects):
+        return [
+            [obj.matrix_world.translation.copy() for obj in chain]
+            for chain in control_objects
+        ]
+    return {
+        direction: [
             obj.matrix_world.translation.copy()
             for obj in control_objects[direction]
         ]
-    return result
-
+        for direction in CONTROL_DIRECTIONS
+    }
 
 def interpolate_vertical_control(direction_points, v):
     """
@@ -3247,11 +3909,25 @@ def _fit_asym_dense_point(
     surface_parameters,
     bone_inset,
     ring_fit_strength,
+    up=None,
 ):
-    radial_vector = Vector(target) - Vector(center)
+    """Fit one outer-envelope point in the horizontal cage plane.
+
+    Separating height from radius is essential for strongly asymmetric hems:
+    a chain being higher or lower must not shorten its top-view radius.
+    """
+    target = Vector(target)
+    center = Vector(center)
+    up = _safe_normalized(
+        Vector(up) if up is not None else Vector((0.0, 0.0, 1.0)),
+        Vector((0.0, 0.0, 1.0)),
+    )
+    slice_center = center + up * (target - center).dot(up)
+    radial_vector = target - slice_center
+    radial_vector -= up * radial_vector.dot(up)
     cage_radius = radial_vector.length
     if cage_radius <= EPSILON:
-        return Vector(target)
+        return target
     radial = radial_vector / cage_radius
     maximum = cage_radius * (1.0 - clamp(float(bone_inset), 0.0, 0.95))
 
@@ -3270,36 +3946,164 @@ def _fit_asym_dense_point(
 
     scored = []
     for index in nearby:
-        delta = Vector(surface_points[index]) - Vector(center)
-        radius = delta.dot(radial)
-        if radius <= 0.0 or delta.length_squared <= EPSILON:
+        delta = Vector(surface_points[index]) - slice_center
+        horizontal = delta - up * delta.dot(up)
+        if horizontal.length_squared <= EPSILON:
             continue
-        direction_score = delta.normalized().dot(radial)
+        radius = horizontal.dot(radial)
+        if radius <= 0.0:
+            continue
+        direction_score = horizontal.normalized().dot(radial)
         if direction_score <= 0.10:
             continue
         ds = _circular_distance(surface_parameters[index][0], target_s)
         dv = abs(surface_parameters[index][1] - target_v)
         angular_score = max(1.0 - ds / 0.25, 0.05)
         vertical_score = max(1.0 - dv / max(band, EPSILON), 0.05)
-        weight = direction_score * angular_score * vertical_score
+        weight = direction_score * direction_score * angular_score * vertical_score
         scored.append((radius, weight))
     if not scored:
-        return Vector(center) + radial * maximum
+        return slice_center + radial * maximum
 
     scored.sort(key=lambda item: item[0], reverse=True)
-    selected = scored[:min(5, len(scored))]
+    selected = scored[:min(8, len(scored))]
     total = sum(weight for _radius, weight in selected)
-    fitted = (
+    weighted = (
         sum(radius * weight for radius, weight in selected) / total
         if total > EPSILON else selected[0][0]
     )
+    # Keep a small exterior safety margin when inner layers share the slice.
+    fitted = max(weighted, selected[0][0] * 1.02)
     fitted = clamp(fitted, 0.0, maximum)
     radius = _lerp_float(
         maximum,
         fitted,
         clamp(float(ring_fit_strength), 0.0, 1.0),
     )
-    return Vector(center) + radial * radius
+    return slice_center + radial * radius
+
+def _cyclic_layout_bracket(values, value):
+    value = float(value) % 1.0
+    count = len(values)
+    if count < 2:
+        return 0, 0, 0.0
+    for following in range(1, count):
+        if value < values[following]:
+            first = following - 1
+            span = max(values[following] - values[first], EPSILON)
+            return first, following, clamp(
+                (value - values[first]) / span,
+                0.0,
+                1.0,
+            )
+    first = count - 1
+    following = 0
+    span = max(1.0 - values[first] + values[0], EPSILON)
+    return first, following, clamp(
+        (value - values[first]) / span,
+        0.0,
+        1.0,
+    )
+
+
+def _ray_segment_radius_in_plane(first, second, ray, up):
+    """Return the radius where a 2D ray intersects a polygon edge."""
+    first = Vector(first)
+    second = Vector(second)
+    ray = _safe_normalized(ray, first)
+    up = _safe_normalized(up, Vector((0.0, 0.0, 1.0)))
+    segment = second - first
+    denominator = up.dot(segment.cross(ray))
+    if abs(denominator) <= EPSILON:
+        return max(first.dot(ray), second.dot(ray), 0.0)
+    factor = -up.dot(first.cross(ray)) / denominator
+    if factor < -1.0e-5 or factor > 1.0 + 1.0e-5:
+        return max(first.dot(ray), second.dot(ray), 0.0)
+    intersection = first + segment * clamp(factor, 0.0, 1.0)
+    return max(intersection.dot(ray), 0.0)
+
+
+def _expand_variable_outer_envelope(
+    dense_chains,
+    centers,
+    layout,
+    control_points,
+    surface_points,
+    surface_parameters,
+    up,
+    bone_inset,
+):
+    """Expand sparse polygon rings so straight edges cover the outer point cloud."""
+    columns = len(dense_chains)
+    if columns < 3 or not dense_chains:
+        return dense_chains
+    dense_count = len(dense_chains[0]) - 1
+    if dense_count < 1:
+        return dense_chains
+    up = _safe_normalized(up, Vector((0.0, 0.0, 1.0)))
+    buckets = [[] for _step in range(dense_count + 1)]
+    for index, (_point_s, point_v) in enumerate(surface_parameters):
+        step = int(clamp(round(point_v * dense_count), 0, dense_count))
+        buckets[step].append(index)
+
+    layout_s = layout["physical_s"]
+    raw_us = layout["raw_us"]
+    inset_scale = 1.0 - clamp(float(bone_inset), 0.0, 0.95)
+    for step, indices in enumerate(buckets):
+        if not indices:
+            continue
+        local_v = step / dense_count
+        center = Vector(centers[step])
+        horizontal_points = []
+        for column in range(columns):
+            point = Vector(dense_chains[column][step])
+            delta = point - center
+            horizontal_points.append(delta - up * delta.dot(up))
+        scales = [1.0] * columns
+        for index in indices:
+            delta = Vector(surface_points[index]) - center
+            horizontal = delta - up * delta.dot(up)
+            point_radius = horizontal.length
+            if point_radius <= EPSILON:
+                continue
+            ray = horizontal / point_radius
+            first, following, _factor = _cyclic_layout_bracket(
+                layout_s,
+                surface_parameters[index][0],
+            )
+            available = _ray_segment_radius_in_plane(
+                horizontal_points[first],
+                horizontal_points[following],
+                ray,
+                up,
+            )
+            if available <= EPSILON or point_radius <= available:
+                continue
+            expansion = point_radius / available * 1.01
+            scales[first] = max(scales[first], expansion)
+            scales[following] = max(scales[following], expansion)
+
+        for column, scale in enumerate(scales):
+            if scale <= 1.0 + 1.0e-6:
+                continue
+            cage_target = _variable_asym_surface_point(
+                control_points,
+                raw_us[column],
+                local_v,
+            )
+            cage_axis = center + up * (cage_target - center).dot(up)
+            cage_delta = cage_target - cage_axis
+            cage_delta -= up * cage_delta.dot(up)
+            cage_radius = cage_delta.length * inset_scale
+            if cage_radius <= EPSILON:
+                continue
+            point = Vector(dense_chains[column][step])
+            point_axis = center + up * (point - center).dot(up)
+            radial = cage_delta.normalized()
+            current_radius = max((point - point_axis).dot(radial), 0.0)
+            expanded_radius = min(current_radius * scale, cage_radius)
+            dense_chains[column][step] = point_axis + radial * expanded_radius
+    return dense_chains
 
 
 def build_asymmetric_joint_grid(
@@ -3384,6 +4188,7 @@ def build_asymmetric_joint_grid(
                 surface_parameters,
                 settings.bone_inset,
                 settings.ring_fit_strength,
+                up=hem_profile["up"],
             ))
         chains.append(_equal_chord_chain(dense_chain, settings.rows))
 
@@ -3805,6 +4610,630 @@ def apply_asymmetric_proxy_weights(
     return assignments
 
 
+def _variable_asym_ring_point(control_points, level, raw_u):
+    count = len(control_points)
+    if count < 2:
+        raise ValueError("不对称裙摆至少需要 4 条控制链")
+    value = (float(raw_u) % 1.0) * count
+    first = int(math.floor(value)) % count
+    second = (first + 1) % count
+    factor = smoothstep(value - math.floor(value))
+    return Vector(control_points[first][level]).lerp(
+        Vector(control_points[second][level]),
+        factor,
+    )
+
+
+def _variable_asym_surface_point(control_points, raw_u, local_v):
+    rail = [
+        _variable_asym_ring_point(control_points, level, raw_u)
+        for level in range(CONTROL_LEVELS)
+    ]
+    return interpolate_vertical_control(rail, local_v)
+
+
+def _variable_sector_arc_data(control_points, samples_per_sector=64):
+    chain_count = len(control_points)
+    sectors = []
+    for sector in range(chain_count):
+        cumulative = [0.0]
+        previous = [
+            _variable_asym_ring_point(
+                control_points,
+                level,
+                sector / chain_count,
+            )
+            for level in range(CONTROL_LEVELS)
+        ]
+        for step in range(1, samples_per_sector + 1):
+            raw_u = (sector + step / samples_per_sector) / chain_count
+            current = [
+                _variable_asym_ring_point(control_points, level, raw_u)
+                for level in range(CONTROL_LEVELS)
+            ]
+            length = sum(
+                (current[level] - previous[level]).length
+                for level in range(CONTROL_LEVELS)
+            ) / CONTROL_LEVELS
+            cumulative.append(cumulative[-1] + max(length, EPSILON))
+            previous = current
+        sectors.append({
+            "cumulative": cumulative,
+            "length": cumulative[-1],
+            "samples": samples_per_sector,
+        })
+    return sectors
+
+
+def _allocate_sector_intervals(sector_lengths, total_columns):
+    sector_count = len(sector_lengths)
+    if total_columns < sector_count:
+        raise ValueError("骨骼链数不能少于控制点链数")
+    intervals = [1] * sector_count
+    remaining = total_columns - sector_count
+    total_length = sum(sector_lengths)
+    if remaining <= 0:
+        return intervals
+    if total_length <= EPSILON:
+        for index in range(remaining):
+            intervals[index % sector_count] += 1
+        return intervals
+    exact = [remaining * length / total_length for length in sector_lengths]
+    floors = [int(math.floor(value)) for value in exact]
+    for index, value in enumerate(floors):
+        intervals[index] += value
+    leftover = remaining - sum(floors)
+    order = sorted(
+        range(sector_count),
+        key=lambda index: (exact[index] - floors[index], sector_lengths[index]),
+        reverse=True,
+    )
+    for index in order[:leftover]:
+        intervals[index] += 1
+    return intervals
+
+
+def _sector_fraction_from_arc(sector_data, fraction):
+    fraction = clamp(float(fraction), 0.0, 1.0)
+    cumulative = sector_data["cumulative"]
+    target = fraction * sector_data["length"]
+    low = 0
+    high = sector_data["samples"]
+    while low + 1 < high:
+        middle = (low + high) // 2
+        if cumulative[middle] <= target:
+            low = middle
+        else:
+            high = middle
+    span = cumulative[low + 1] - cumulative[low]
+    factor = 0.0 if span <= EPSILON else (
+        (target - cumulative[low]) / span
+    )
+    return (low + factor) / sector_data["samples"]
+
+
+def _build_variable_chain_layout(
+    control_points,
+    total_columns,
+    anchor_bone_counts,
+    sector_data=None,
+    arc_mapping=None,
+):
+    chain_count = len(control_points)
+    if arc_mapping is not None:
+        # Sample the complete fitted envelope at globally uniform arc-length
+        # intervals. Control anchors still drive the interpolated bone counts,
+        # but no sector is allowed to create a visibly short or long edge.
+        physical_s = [column / total_columns for column in range(total_columns)]
+        raw_us = [
+            _raw_u_from_arc_s(arc_mapping, value)
+            for value in physical_s
+        ]
+        bone_counts = []
+        sector_intervals = [0] * chain_count
+        for raw_u in raw_us:
+            value = (raw_u % 1.0) * chain_count
+            first = int(math.floor(value)) % chain_count
+            following = (first + 1) % chain_count
+            factor = value - math.floor(value)
+            sector_intervals[first] += 1
+            bone_counts.append(int(clamp(round(_lerp_float(
+                anchor_bone_counts[first],
+                anchor_bone_counts[following],
+                factor,
+            )), 1, 64)))
+
+        # Keep every user count represented by the nearest unique generated
+        # chain without moving that chain away from its uniform position.
+        anchor_columns = []
+        used_columns = set()
+        for anchor in range(chain_count):
+            anchor_s = _arc_s_from_raw_u(
+                arc_mapping,
+                anchor / chain_count,
+            )
+            candidates = sorted(
+                range(total_columns),
+                key=lambda column: _circular_distance(
+                    column / total_columns,
+                    anchor_s,
+                ),
+            )
+            column = next(
+                candidate for candidate in candidates
+                if candidate not in used_columns
+            )
+            used_columns.add(column)
+            anchor_columns.append(column)
+            bone_counts[column] = int(clamp(
+                anchor_bone_counts[anchor],
+                1,
+                64,
+            ))
+        return {
+            "raw_us": raw_us,
+            "physical_s": physical_s,
+            "bone_counts": bone_counts,
+            "sector_intervals": sector_intervals,
+            "anchor_columns": anchor_columns,
+        }
+
+    sectors = (
+        sector_data
+        if sector_data is not None and len(sector_data) == chain_count
+        else _variable_sector_arc_data(control_points)
+    )
+    lengths = [sector["length"] for sector in sectors]
+    intervals = _allocate_sector_intervals(lengths, total_columns)
+    total_length = max(sum(lengths), EPSILON)
+    accumulated_length = 0.0
+    raw_us = []
+    physical_s = []
+    bone_counts = []
+    anchor_columns = []
+    for sector, interval_count in enumerate(intervals):
+        anchor_columns.append(len(raw_us))
+        following = (sector + 1) % chain_count
+        for step in range(interval_count):
+            arc_fraction = step / interval_count
+            local_fraction = _sector_fraction_from_arc(
+                sectors[sector],
+                arc_fraction,
+            )
+            raw_us.append((sector + local_fraction) / chain_count)
+            physical_s.append((
+                accumulated_length + arc_fraction * lengths[sector]
+            ) / total_length)
+            bone_counts.append(int(clamp(round(_lerp_float(
+                anchor_bone_counts[sector],
+                anchor_bone_counts[following],
+                arc_fraction,
+            )), 1, 64)))
+        accumulated_length += lengths[sector]
+    return {
+        "raw_us": raw_us,
+        "physical_s": physical_s,
+        "bone_counts": bone_counts,
+        "sector_intervals": intervals,
+        "anchor_columns": anchor_columns,
+    }
+
+
+def _build_variable_arc_mapping(control_points, resolution=256):
+    resolution = max(int(resolution), 64)
+    cumulative = [0.0]
+    previous = [
+        _variable_asym_ring_point(control_points, level, 0.0)
+        for level in range(CONTROL_LEVELS)
+    ]
+    for sample in range(1, resolution + 1):
+        raw_u = sample / resolution
+        current = [
+            _variable_asym_ring_point(control_points, level, raw_u)
+            for level in range(CONTROL_LEVELS)
+        ]
+        length = sum(
+            (current[level] - previous[level]).length
+            for level in range(CONTROL_LEVELS)
+        ) / CONTROL_LEVELS
+        cumulative.append(cumulative[-1] + max(length, EPSILON))
+        previous = current
+    return {
+        "resolution": resolution,
+        "cumulative": cumulative,
+        "total": cumulative[-1],
+    }
+
+
+def _initial_variable_asym_parameters(
+    surface_points,
+    control_points,
+    profile,
+    arc_mapping,
+):
+    center = profile["center"]
+    right = profile["right"]
+    back = profile["back"]
+    rail_cache = {}
+    parameters = []
+    for point in surface_points:
+        raw_u = _raw_skirt_u(point, center, right, back)
+        cache_index = int(round(
+            raw_u * arc_mapping["resolution"]
+        )) % arc_mapping["resolution"]
+        if cache_index not in rail_cache:
+            cached_u = cache_index / arc_mapping["resolution"]
+            rail_cache[cache_index] = [
+                _variable_asym_surface_point(
+                    control_points,
+                    cached_u,
+                    step / 48.0,
+                )
+                for step in range(49)
+            ]
+        local_v = _closest_polyline_parameter(
+            point,
+            rail_cache[cache_index],
+        )
+        parameters.append((
+            _arc_s_from_raw_u(arc_mapping, raw_u),
+            local_v,
+        ))
+    return parameters
+
+
+def _interpolate_vector_samples(values, factor):
+    if not values:
+        return Vector((1.0, 0.0, 0.0))
+    if len(values) == 1:
+        return Vector(values[0])
+    value = clamp(float(factor), 0.0, 1.0) * (len(values) - 1)
+    first = min(int(math.floor(value)), len(values) - 1)
+    second = min(first + 1, len(values) - 1)
+    return _safe_normalized(
+        Vector(values[first]).lerp(
+            Vector(values[second]),
+            value - math.floor(value),
+        ),
+        values[first],
+    )
+
+
+def build_variable_asymmetric_data(
+    control_points,
+    surface_points,
+    settings,
+    anchor_bone_counts,
+):
+    if not 4 <= len(control_points) <= 10:
+        raise ValueError("不对称控制点链数必须在 4 到 10 之间")
+    if int(settings.columns) < len(control_points):
+        raise ValueError("骨骼链数不能少于控制点链数")
+    profile = _fit_smooth_hem_profile(
+        [{"world": Vector(point)} for point in surface_points],
+        settings.target_armature,
+        sample_count=max(128, settings.columns * 8),
+    )
+    arc_mapping = _build_point_cloud_average_arc_mapping(
+        surface_points,
+        control_points,
+        profile,
+        resolution=max(128, settings.columns * 8),
+    )
+    max_bones = max(int(value) for value in anchor_bone_counts)
+    dense_count = min(max(max_bones * 10, 64), 640)
+    center_sample_count = max(settings.columns * 2, 32)
+    centers = []
+    for step in range(dense_count + 1):
+        local_v = step / dense_count
+        centers.append(_average_points([
+            _variable_asym_surface_point(
+                control_points,
+                sample / center_sample_count,
+                local_v,
+            )
+            for sample in range(center_sample_count)
+        ]))
+
+    layout = None
+    surface_parameters = None
+    dense_chains = None
+    # Two correction passes use the actually fitted surface to remove residual
+    # spacing differences introduced by waist/hem shape changes.
+    for spacing_pass in range(3):
+        layout = _build_variable_chain_layout(
+            control_points,
+            int(settings.columns),
+            anchor_bone_counts,
+            arc_mapping=arc_mapping,
+        )
+        surface_parameters = _initial_variable_asym_parameters(
+            surface_points,
+            control_points,
+            profile,
+            arc_mapping,
+        )
+        dense_chains = []
+        for column, (raw_u, target_s, _bone_count) in enumerate(zip(
+            layout["raw_us"],
+            layout["physical_s"],
+            layout["bone_counts"],
+        )):
+            window = max(1.75 / settings.columns, 0.04)
+            candidates = []
+            for _attempt in range(6):
+                candidates = [
+                    index
+                    for index, (point_s, _point_v) in enumerate(surface_parameters)
+                    if _circular_distance(point_s, target_s) <= window
+                ]
+                if len(candidates) >= 8:
+                    break
+                window = min(window * 1.6, 0.5)
+            if not candidates:
+                candidates = list(range(len(surface_points)))
+
+            dense_chain = []
+            for step in range(dense_count + 1):
+                local_v = step / dense_count
+                target = _variable_asym_surface_point(
+                    control_points,
+                    raw_u,
+                    local_v,
+                )
+                dense_chain.append(_fit_asym_dense_point(
+                    target,
+                    centers[step],
+                    target_s,
+                    local_v,
+                    candidates,
+                    surface_points,
+                    surface_parameters,
+                    settings.bone_inset,
+                    settings.ring_fit_strength,
+                    up=profile["up"],
+                ))
+            dense_chains.append(dense_chain)
+
+        dense_chains = _expand_variable_outer_envelope(
+            dense_chains,
+            centers,
+            layout,
+            control_points,
+            surface_points,
+            surface_parameters,
+            profile["up"],
+            settings.bone_inset,
+        )
+        if spacing_pass < 2:
+            corrected_mapping = _build_fitted_chain_arc_mapping(
+                layout["raw_us"],
+                dense_chains,
+                profile["up"],
+                resolution=max(128, settings.columns * 8),
+            )
+            if corrected_mapping is not None:
+                arc_mapping = corrected_mapping
+
+    bone_chains = []
+    preview_chains = []
+    chain_lengths = []
+    for column, (dense_chain, bone_count) in enumerate(zip(
+        dense_chains,
+        layout["bone_counts"],
+    )):
+        bone_chain = _equal_chord_chain(dense_chain, bone_count)
+        preview_chain = _equal_chord_chain(dense_chain, max_bones)
+        bone_chains.append(bone_chain)
+        preview_chains.append(preview_chain)
+        chain_lengths.append(sum(
+            (bone_chain[index + 1] - bone_chain[index]).length
+            for index in range(len(bone_chain) - 1)
+        ))
+
+    preview_grid = [
+        [preview_chains[column][row] for column in range(settings.columns)]
+        for row in range(max_bones + 1)
+    ]
+    proxy_normals = _proxy_grid_vertex_normals(preview_grid, True)
+    bone_z_axes = []
+    for column, bone_count in enumerate(layout["bone_counts"]):
+        column_normals = [row[column] for row in proxy_normals]
+        bone_z_axes.append([
+            -_interpolate_vector_samples(
+                column_normals,
+                joint / bone_count,
+            )
+            for joint in range(bone_count + 1)
+        ])
+    return {
+        "bone_chains": bone_chains,
+        "preview_grid": preview_grid,
+        "bone_counts": layout["bone_counts"],
+        "anchor_columns": layout["anchor_columns"],
+        "sector_intervals": layout["sector_intervals"],
+        "chain_lengths": chain_lengths,
+        "bone_z_axes": bone_z_axes,
+        "projector": _build_asymmetric_parameter_projector(preview_grid),
+        "raw_us": layout["raw_us"],
+    }
+
+
+def create_variable_asymmetric_bones(
+    armature,
+    bone_chains,
+    bone_z_axes,
+    parent_bone_name,
+    prefix,
+    bone_collection_name="",
+):
+    if armature.type != 'ARMATURE' or armature.mode != 'EDIT':
+        raise ValueError("创建骨骼时 Armature 必须处于编辑模式")
+    if len(bone_chains) < 4:
+        raise ValueError("不对称裙摆骨骼链数量无效")
+    edit_bones = armature.data.edit_bones
+    parent_bone = edit_bones.get(parent_bone_name)
+    if parent_bone is None:
+        raise ValueError(f"找不到父骨骼：{parent_bone_name}")
+    bone_collection = _get_or_create_bone_collection(
+        armature.data,
+        bone_collection_name,
+    )
+    requested = {
+        _plain_bone_name(prefix, column, row)
+        for column, chain in enumerate(bone_chains)
+        for row in range(len(chain) - 1)
+    }
+    conflicts = sorted(name for name in requested if edit_bones.get(name))
+    if conflicts:
+        raise ValueError(
+            "已存在同名生成骨骼；请启用“清除已有生成骨骼”："
+            + ", ".join(conflicts[:4])
+        )
+    inverse = armature.matrix_world.inverted()
+    normal_to_local = armature.matrix_world.to_3x3().transposed()
+    created = []
+    for column, chain in enumerate(bone_chains):
+        previous = None
+        for row in range(len(chain) - 1):
+            name = _plain_bone_name(prefix, column, row)
+            bone = edit_bones.new(name)
+            bone.head = inverse @ Vector(chain[row])
+            bone.tail = inverse @ Vector(chain[row + 1])
+            if (bone.tail - bone.head).length_squared <= EPSILON:
+                raise ValueError(f"不对称裙摆骨骼长度为零：{name}")
+            bone.parent = parent_bone if row == 0 else previous
+            bone.use_connect = row > 0
+            bone.use_deform = True
+            if bone_collection is not None:
+                bone_collection.assign(bone)
+            normal = (
+                bone_z_axes[column][row]
+                if column < len(bone_z_axes)
+                and row < len(bone_z_axes[column])
+                else Vector((1.0, 0.0, 0.0))
+            )
+            _align_bone_roll(
+                bone,
+                _safe_normalized(
+                    normal_to_local @ Vector(normal),
+                    Vector((1.0, 0.0, 0.0)),
+                ),
+            )
+            previous = bone
+            created.append(name)
+    return created
+
+
+def compute_variable_asymmetric_vertex_weights(
+    arc_s,
+    local_v,
+    bone_counts,
+    prefix,
+    settings,
+    parent_weight,
+):
+    columns = len(bone_counts)
+    column_value = (float(arc_s) % 1.0) * columns
+    base_column = int(math.floor(column_value))
+    column0 = base_column % columns
+    column1 = (column0 + 1) % columns
+    column_factor = column_value - base_column
+    column_weight1 = smoothstep(column_factor)
+    column_weight0 = 1.0 - column_weight1
+    skirt_scale = 1.0 - clamp(float(parent_weight), 0.0, 1.0)
+    weights = {}
+    for column, column_weight in (
+        (column0, column_weight0),
+        (column1, column_weight1),
+    ):
+        count = int(bone_counts[column])
+        row_value = clamp(
+            float(local_v) * count - 0.5,
+            0.0,
+            count - 1.0,
+        )
+        row0 = min(int(math.floor(row_value)), count - 1)
+        row1 = min(row0 + 1, count - 1)
+        row_factor = row_value - math.floor(row_value)
+        row_weight0, row_weight1 = _vertical_weights(
+            row_factor,
+            settings.weight_curve,
+        )
+        for row, row_weight in (
+            (row0, row_weight0),
+            (row1, row_weight1),
+        ):
+            name = _plain_bone_name(prefix, column, row)
+            weights[name] = weights.get(name, 0.0) + (
+                row_weight * column_weight * skirt_scale
+            )
+    weights = {
+        name: value for name, value in weights.items()
+        if value >= MIN_WEIGHT
+    }
+    parent_is_active = parent_weight >= MIN_WEIGHT
+    skirt_slots = settings.max_influences - (1 if parent_is_active else 0)
+    weights = dict(sorted(
+        weights.items(),
+        key=lambda item: item[1],
+        reverse=True,
+    )[:max(skirt_slots, 0)])
+    if parent_is_active:
+        weights[PARENT_WEIGHT_KEY] = parent_weight
+    if settings.normalize_weights:
+        total = sum(weights.values())
+        if total > EPSILON:
+            weights = {name: value / total for name, value in weights.items()}
+    return weights
+
+
+def apply_variable_asymmetric_proxy_weights(
+    proxy_obj,
+    armature_obj,
+    preview_grid,
+    bone_counts,
+    chain_lengths,
+    prefix,
+    parent_bone_name,
+    settings,
+):
+    if proxy_obj is None or proxy_obj.type != 'MESH':
+        return 0
+    rows = len(preview_grid)
+    columns = len(bone_counts)
+    indices = list(range(len(proxy_obj.data.vertices)))
+    weights = {}
+    for row in range(rows):
+        local_v = row / max(rows - 1, 1)
+        for column in range(columns):
+            index = row * columns + column
+            arc_s = column / columns
+            parent_weight = _asymmetric_parent_weight(
+                arc_s,
+                local_v,
+                chain_lengths,
+            )
+            weights[index] = compute_variable_asymmetric_vertex_weights(
+                arc_s,
+                local_v,
+                bone_counts,
+                prefix,
+                settings,
+                parent_weight,
+            )
+    assignments = apply_weights(
+        proxy_obj,
+        indices,
+        weights,
+        prefix,
+        parent_bone_name,
+        True,
+        settings.top_blend_to_parent,
+    )
+    _ensure_armature_modifier(proxy_obj, armature_obj)
+    return assignments
+
 def _prepare_asymmetric_build_data(
     primary_mesh,
     armature,
@@ -3812,31 +5241,28 @@ def _prepare_asymmetric_build_data(
     surface_points,
     settings,
 ):
-    base_l3 = _load_asym_base_l3(primary_mesh)
-    if any(direction not in base_l3 for direction in CONTROL_DIRECTIONS):
-        raise ValueError("不对称裙摆缺少 L3 拟合基准，请重新生成控制点")
-    joint_grid, chain_lengths, hem_profile, arc_mapping = (
-        build_asymmetric_joint_grid(
-            control_points,
-            surface_points,
-            settings,
-            base_l3,
-        )
+    del armature
+    if not _controls_are_asymmetric(control_points):
+        raise ValueError("旧版不对称控制点不兼容，请重新生成控制点")
+    if len(control_points) != int(settings.asym_control_chain_count):
+        raise ValueError("不对称控制点链数已改变，请重新应用控制链数量")
+    anchor_counts = _get_asym_anchor_bone_counts(
+        settings,
+        len(control_points),
     )
-    proxy_normals = _proxy_grid_vertex_normals(joint_grid, True)
-    bone_z_axes = [
-        [-normal for normal in row]
-        for row in proxy_normals
-    ]
-    projector = _build_asymmetric_parameter_projector(joint_grid)
-    return {
-        "joint_grid": joint_grid,
-        "chain_lengths": chain_lengths,
-        "hem_profile": hem_profile,
-        "arc_mapping": arc_mapping,
-        "bone_z_axes": bone_z_axes,
-        "projector": projector,
-    }
+    data = build_variable_asymmetric_data(
+        control_points,
+        surface_points,
+        settings,
+        anchor_counts,
+    )
+    data["anchor_bone_counts"] = anchor_counts
+    primary_mesh[PROP_ASYM_CONTROL_CHAINS] = len(control_points)
+    primary_mesh[PROP_ASYM_BONE_COUNTS] = json.dumps(
+        anchor_counts,
+        separators=(",", ":"),
+    )
+    return data
 
 # ---------------------------------------------------------------------------
 # Build validation and orchestration
@@ -3896,10 +5322,15 @@ def _validate_build(context, settings, require_selection):
             raise ValueError(f"Target Mesh '{mesh_obj.name}' is not in this View Layer.")
     if not _scene_has_object(context, armature):
         raise ValueError("Target Armature is not in this View Layer.")
-    if settings.rows < 2:
-        raise ValueError("Rows must be at least 2.")
+    if settings.skirt_shape_mode == 'STANDARD' and settings.rows < 2:
+        raise ValueError("纵向层数必须至少为 2")
     if settings.columns < 4:
-        raise ValueError("Columns must be at least 4.")
+        raise ValueError("骨骼链数必须至少为 4")
+    if (
+        settings.skirt_shape_mode == 'ASYMMETRIC'
+        and settings.columns < settings.asym_control_chain_count
+    ):
+        raise ValueError("骨骼链数不能少于控制点链数")
     if not settings.parent_bone:
         raise ValueError("A Parent Bone is required.")
     if settings.parent_bone.startswith(settings.prefix):
@@ -3921,6 +5352,11 @@ def _validate_build(context, settings, require_selection):
     if collection is None:
         raise ValueError("Control Collection does not exist; generate controls first.")
     controls = find_control_points(collection, settings.prefix, require_all=True)
+    if settings.skirt_shape_mode == 'ASYMMETRIC':
+        if not _controls_are_asymmetric(controls):
+            raise ValueError("旧版不对称控制点不兼容，请重新生成控制点")
+        if len(controls) != int(settings.asym_control_chain_count):
+            raise ValueError("控制点链数与设置不一致")
 
     selection_items = []
     if require_selection:
@@ -3932,6 +5368,43 @@ def _validate_build(context, settings, require_selection):
                 )
             selection_items.append((mesh_obj, indices))
     return primary_mesh, mesh_objects, armature, controls, selection_items
+
+
+def _required_variable_bones_exist(armature, prefix, bone_counts):
+    missing = [
+        _plain_bone_name(prefix, column, row)
+        for column, count in enumerate(bone_counts)
+        for row in range(int(count))
+        if armature.data.bones.get(
+            _plain_bone_name(prefix, column, row)
+        ) is None
+    ]
+    if missing:
+        raise ValueError(
+            "缺少用于赋权的不对称裙骨，请先生成骨骼："
+            + ", ".join(missing[:4])
+        )
+
+def _asym_bone_count_jump_warning(anchor_counts):
+    """Allow sharp count changes, but make the interpolation visible to users."""
+    counts = [int(value) for value in anchor_counts]
+    if len(counts) < 2:
+        return ""
+    jumps = [
+        (
+            index,
+            (index + 1) % len(counts),
+            abs(value - counts[(index + 1) % len(counts)]),
+        )
+        for index, value in enumerate(counts)
+    ]
+    largest = max(jumps, key=lambda item: item[2])
+    if largest[2] <= 2:
+        return ""
+    return (
+        f"相邻控制链 C{largest[0]:02d} 与 C{largest[1]:02d} "
+        f"的骨骼数相差 {largest[2]}；已按设置生成，中间骨骼链使用线性插值。"
+    )
 
 
 def _required_bones_exist(armature, prefix, rows, columns):
@@ -3971,7 +5444,7 @@ def _build(context, settings, build_bones, build_weights):
             surface_points,
             settings,
         )
-        samples = asymmetric_data["joint_grid"]
+        samples = asymmetric_data["preview_grid"]
         bone_z_axes = asymmetric_data["bone_z_axes"]
     else:
         samples, _fitted_sample_normals = build_cage_samples(
@@ -3999,7 +5472,7 @@ def _build(context, settings, build_bones, build_weights):
             for row_normals in proxy_vertex_normals
         ]
 
-    _configure_lr_suffix_naming(samples, settings.use_lr_suffix_names)
+    _configure_lr_suffix_naming(samples, settings.use_lr_suffix_names if not asymmetric else False)
     state = _ContextState(context)
     created_bones = 0
     assignments = 0
@@ -4010,12 +5483,12 @@ def _build(context, settings, build_bones, build_weights):
             if settings.clear_existing_generated_bones:
                 cleanup_generated_bones(armature, settings.prefix)
             if asymmetric:
-                created = create_bones_from_joint_grid(
+                created = create_variable_asymmetric_bones(
                     armature,
-                    asymmetric_data["joint_grid"],
+                    asymmetric_data["bone_chains"],
+                    bone_z_axes,
                     settings.parent_bone,
                     settings.prefix,
-                    sample_normals=bone_z_axes,
                     bone_collection_name=settings.bone_collection,
                 )
             else:
@@ -4037,17 +5510,16 @@ def _build(context, settings, build_bones, build_weights):
             if settings.create_proxy_mesh:
                 if asymmetric:
                     proxy_obj = create_asymmetric_proxy_mesh(
-                        asymmetric_data["joint_grid"],
+                        asymmetric_data["preview_grid"],
                         settings.prefix,
                         primary_mesh.name,
                     )
-                    apply_asymmetric_proxy_weights(
+                    apply_variable_asymmetric_proxy_weights(
                         proxy_obj,
                         armature,
-                        asymmetric_data["joint_grid"],
+                        asymmetric_data["preview_grid"],
+                        asymmetric_data["bone_counts"],
                         asymmetric_data["chain_lengths"],
-                        settings.rows,
-                        settings.columns,
                         settings.prefix,
                         settings.parent_bone,
                         settings,
@@ -4078,9 +5550,19 @@ def _build(context, settings, build_bones, build_weights):
                 )
 
         if build_weights:
-            _required_bones_exist(
-                armature, settings.prefix, settings.rows, settings.columns
-            )
+            if asymmetric:
+                _required_variable_bones_exist(
+                    armature,
+                    settings.prefix,
+                    asymmetric_data["bone_counts"],
+                )
+            else:
+                _required_bones_exist(
+                    armature,
+                    settings.prefix,
+                    settings.rows,
+                    settings.columns,
+                )
             for mesh_obj, selected_indices in selection_items:
                 _activate_object(context, mesh_obj, mode='OBJECT')
                 all_weights = {}
@@ -4097,14 +5579,15 @@ def _build(context, settings, build_bones, build_weights):
                             local_v,
                             asymmetric_data["chain_lengths"],
                         )
-                        all_weights[index] = compute_asymmetric_vertex_weights(
-                            arc_s,
-                            local_v,
-                            settings.rows,
-                            settings.columns,
-                            settings.prefix,
-                            settings,
-                            parent_weight,
+                        all_weights[index] = (
+                            compute_variable_asymmetric_vertex_weights(
+                                arc_s,
+                                local_v,
+                                asymmetric_data["bone_counts"],
+                                settings.prefix,
+                                settings,
+                                parent_weight,
+                            )
                         )
                     else:
                         h, u = compute_vertex_cage_parameters(
@@ -4155,6 +5638,16 @@ def _build(context, settings, build_bones, build_weights):
         if build_weights else 0,
         "assignments": assignments,
         "modifier_added": modifier_added,
+        "warning": (
+            _asym_bone_count_jump_warning(
+                _get_asym_anchor_bone_counts(
+                    settings,
+                    settings.asym_control_chain_count,
+                )
+            )
+            if asymmetric
+            else ""
+        ),
     }
 
 def _delete_generated_bones_and_groups(context, settings):
@@ -4192,10 +5685,123 @@ def _delete_generated_bones_and_groups(context, settings):
 # ---------------------------------------------------------------------------
 
 
+def _resample_asym_control_points(control_points, new_count):
+    old_count = len(control_points)
+    if old_count < 1:
+        return []
+    result = []
+    for chain in range(new_count):
+        value = chain * old_count / new_count
+        first = int(math.floor(value)) % old_count
+        second = (first + 1) % old_count
+        factor = smoothstep(value - math.floor(value))
+        result.append([
+            Vector(control_points[first][level]).lerp(
+                Vector(control_points[second][level]),
+                factor,
+            )
+            for level in range(CONTROL_LEVELS)
+        ])
+    return result
+
+
+def _resample_cyclic_counts(values, new_count, fallback):
+    values = list(values)
+    if not values:
+        return [int(fallback)] * new_count
+    old_count = len(values)
+    result = []
+    for chain in range(new_count):
+        value = chain * old_count / new_count
+        first = int(math.floor(value)) % old_count
+        second = (first + 1) % old_count
+        factor = value - math.floor(value)
+        result.append(int(clamp(round(_lerp_float(
+            values[first], values[second], factor
+        )), 1, 64)))
+    return result
+
+
+def _update_asym_control_chain_count(settings, context):
+    global _ASYM_CONTROL_RESAMPLE_GUARD
+    if _ASYM_CONTROL_RESAMPLE_GUARD or settings.skirt_shape_mode != 'ASYMMETRIC':
+        return
+    if context is None or context.scene is None:
+        return
+    primary_mesh = _resolve_target_mesh(context, settings)
+    if primary_mesh is None or primary_mesh.type != 'MESH':
+        return
+    collection_name = str(primary_mesh.get(
+        PROP_COLLECTION,
+        _control_collection_name(settings.prefix, primary_mesh.name),
+    ))
+    collection = bpy.data.collections.get(collection_name)
+    if collection is None:
+        return
+    controls = find_control_points(collection, settings.prefix, require_all=False)
+    if not _controls_are_asymmetric(controls) or not controls:
+        return
+    old_count = len(controls)
+    new_count = int(clamp(settings.asym_control_chain_count, 4, 10))
+    if old_count == new_count:
+        return
+
+    _ASYM_CONTROL_RESAMPLE_GUARD = True
+    try:
+        world_points = _control_world_locations(controls)
+        new_points = _resample_asym_control_points(world_points, new_count)
+        old_counts = _load_stored_asym_bone_counts(
+            primary_mesh,
+            _get_asym_anchor_bone_counts(settings, old_count),
+        )
+        new_counts = _resample_cyclic_counts(
+            old_counts,
+            new_count,
+            settings.asym_default_bone_count,
+        )
+        display_size = max(
+            (obj.empty_display_size for obj in _flatten_control_objects(controls)),
+            default=0.05,
+        )
+        for obj in list(_flatten_control_objects(controls)):
+            bpy.data.objects.remove(obj, do_unlink=True)
+        _set_asym_anchor_bone_counts(settings, new_counts, new_count)
+        settings.columns = max(int(settings.columns), new_count)
+        new_collection = _create_or_update_asymmetric_controls(
+            primary_mesh,
+            settings,
+            new_points,
+            display_size,
+            update_existing=False,
+        )
+        new_controls = find_control_points(
+            new_collection,
+            settings.prefix,
+            require_all=True,
+        )
+        target_meshes = _stored_target_meshes(primary_mesh)
+        for mesh_obj in target_meshes:
+            _store_mesh_metadata(
+                mesh_obj,
+                settings,
+                new_collection.name,
+                target_meshes,
+            )
+        if settings.control_edit_active:
+            _set_controls_locked(new_controls, False)
+            _select_only_controls(context, new_controls)
+            settings.control_edit_snapshot = _json_position_map(new_controls)
+            settings.control_edit_last_positions = settings.control_edit_snapshot
+        _LIVE_PROXY_CACHE["signature"] = None
+        for area in context.screen.areas if context.screen else []:
+            area.tag_redraw()
+    finally:
+        _ASYM_CONTROL_RESAMPLE_GUARD = False
+
 class AUTOSKIRT_OT_generate_control_points(bpy.types.Operator):
     bl_idname = "auto_skirt.generate_control_points"
     bl_label = "生成控制点"
-    bl_description = "根据编辑模式中选中的顶点生成 16 个可编辑控制点"
+    bl_description = "根据编辑模式选区生成标准四向控制点或 4–10 条不对称控制链"
     bl_options = {'REGISTER', 'UNDO'}
 
     def execute(self, context):
@@ -4206,9 +5812,13 @@ class AUTOSKIRT_OT_generate_control_points(bpy.types.Operator):
         except (ValueError, RuntimeError) as exc:
             self.report({'ERROR'}, str(exc))
             return {'CANCELLED'}
+        control_count = sum(
+            1 for obj in collection.objects
+            if obj.get(PROP_KIND) == EDIT_KIND_CONTROL
+        )
         self.report(
             {'INFO'},
-            f"已从 {count} 个顶点生成 16 个控制点，并进入控制点编辑：{collection.name}",
+            f"已从 {count} 个顶点生成 {control_count} 个控制点，并进入控制点编辑：{collection.name}",
         )
         return {'FINISHED'}
 
@@ -4216,7 +5826,7 @@ class AUTOSKIRT_OT_generate_control_points(bpy.types.Operator):
 class AUTOSKIRT_OT_refit_control_points(bpy.types.Operator):
     bl_idname = "auto_skirt.refit_control_points"
     bl_label = "按选区重新拟合控制点"
-    bl_description = "将现有 16 个控制点重新拟合到当前编辑模式选区"
+    bl_description = "将现有控制点重新拟合到当前编辑模式选区"
     bl_options = {'REGISTER', 'UNDO'}
 
     def execute(self, context):
@@ -4303,6 +5913,88 @@ class AUTOSKIRT_OT_reset_control_edit(bpy.types.Operator):
         return {'FINISHED'}
 
 
+def _persist_asym_count_settings(primary_mesh, settings):
+    values = _get_asym_anchor_bone_counts(settings)
+    targets = _stored_target_meshes(primary_mesh)
+    for mesh_obj in targets:
+        mesh_obj[PROP_ASYM_CONTROL_CHAINS] = int(
+            settings.asym_control_chain_count
+        )
+        mesh_obj[PROP_ASYM_BONE_COUNTS] = json.dumps(
+            values,
+            separators=(",", ":"),
+        )
+    _LIVE_PROXY_CACHE["signature"] = None
+
+
+class AUTOSKIRT_OT_auto_asym_bone_counts(bpy.types.Operator):
+    bl_idname = "auto_skirt.auto_asym_bone_counts"
+    bl_label = "自动计算每链骨骼数"
+    bl_description = "按各控制链实际弧长和默认骨骼数自动计算"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        settings = context.scene.auto_skirt_settings
+        if settings.skirt_shape_mode != 'ASYMMETRIC':
+            self.report({'ERROR'}, "仅不对称裙摆使用此功能")
+            return {'CANCELLED'}
+        try:
+            primary_mesh, _collection, controls = _control_edit_collection(
+                context, settings
+            )
+            if not _controls_are_asymmetric(controls):
+                raise ValueError("请先重新生成不对称裙摆控制点")
+            counts = _auto_asym_anchor_bone_counts(
+                settings,
+                _control_world_locations(controls),
+            )
+            _persist_asym_count_settings(primary_mesh, settings)
+        except (ValueError, RuntimeError) as exc:
+            self.report({'ERROR'}, str(exc))
+            return {'CANCELLED'}
+        self.report({'INFO'}, "已自动计算：" + ", ".join(map(str, counts)))
+        return {'FINISHED'}
+
+
+class AUTOSKIRT_OT_uniform_asym_bone_counts(bpy.types.Operator):
+    bl_idname = "auto_skirt.uniform_asym_bone_counts"
+    bl_label = "全部使用默认数量"
+    bl_description = "把所有控制链骨骼数设为默认每链骨骼数"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        settings = context.scene.auto_skirt_settings
+        value = int(clamp(settings.asym_default_bone_count, 1, 64))
+        _set_asym_anchor_bone_counts(
+            settings,
+            [value] * settings.asym_control_chain_count,
+        )
+        primary_mesh = _resolve_target_mesh(context, settings)
+        if primary_mesh is not None:
+            _persist_asym_count_settings(primary_mesh, settings)
+        self.report({'INFO'}, f"所有控制链已设为 {value} 根骨骼")
+        return {'FINISHED'}
+
+
+class AUTOSKIRT_OT_reset_asym_bone_counts(bpy.types.Operator):
+    bl_idname = "auto_skirt.reset_asym_bone_counts"
+    bl_label = "恢复默认"
+    bl_description = "恢复默认每链 6 根骨骼"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        settings = context.scene.auto_skirt_settings
+        settings.asym_default_bone_count = 6
+        _set_asym_anchor_bone_counts(
+            settings,
+            [6] * settings.asym_control_chain_count,
+        )
+        primary_mesh = _resolve_target_mesh(context, settings)
+        if primary_mesh is not None:
+            _persist_asym_count_settings(primary_mesh, settings)
+        self.report({'INFO'}, "不对称裙摆骨骼数已恢复为每链 6 根")
+        return {'FINISHED'}
+
 class AUTOSKIRT_OT_build(bpy.types.Operator):
     bl_idname = "auto_skirt.build"
     bl_label = "生成自动裙骨"
@@ -4344,6 +6036,8 @@ class AUTOSKIRT_OT_build(bpy.types.Operator):
             if result["modifier_added"]:
                 parts.append("已添加 Armature Modifier")
         self.report({'INFO'}, "；".join(parts))
+        if result.get("warning"):
+            self.report({'WARNING'}, result["warning"])
         return {'FINISHED'}
 
 
@@ -4383,6 +6077,10 @@ class AUTOSKIRT_OT_delete_controls(bpy.types.Operator):
                 del mesh_obj[PROP_TARGETS]
             if PROP_ASYM_BASE_L3 in mesh_obj:
                 del mesh_obj[PROP_ASYM_BASE_L3]
+            if PROP_ASYM_CONTROL_CHAINS in mesh_obj:
+                del mesh_obj[PROP_ASYM_CONTROL_CHAINS]
+            if PROP_ASYM_BONE_COUNTS in mesh_obj:
+                del mesh_obj[PROP_ASYM_BONE_COUNTS]
             if PROP_SHAPE_MODE in mesh_obj:
                 del mesh_obj[PROP_SHAPE_MODE]
 
@@ -4443,15 +6141,40 @@ class AUTOSKIRT_PG_settings(bpy.types.PropertyGroup):
         name="裙摆类型",
         items=(
             ('STANDARD', "标准裙摆", "使用原有稳定的闭合裙摆算法"),
-            ('ASYMMETRIC', "不对称裙摆", "腰口对称，按每条骨骼链的局部裙长拟合"),
+            ('ASYMMETRIC', "不对称裙摆", "4–10 条可编辑控制链，每条链可设置独立骨骼数"),
         ),
         default='STANDARD',
     )
     use_lr_suffix_names: BoolProperty(
         name="左右后缀 (.L/.R)",
         default=False,
-        description="开启后按世界原点 X=0 自动配对左右列；负 X 使用 .L，正 X 使用 .R",
+        description="仅标准裙摆使用；不对称裙摆固定按 C/R 编号",
     )
+    asym_control_chain_count: IntProperty(
+        name="控制点链数",
+        default=6,
+        min=4,
+        max=10,
+        description="不对称裙摆的环向控制链数量；修改后从当前控制笼重采样",
+        update=_update_asym_control_chain_count,
+    )
+    asym_default_bone_count: IntProperty(
+        name="默认每链骨骼数",
+        default=6,
+        min=1,
+        max=64,
+        description="自动计算时与平均裙长对应的骨骼数量",
+    )
+    asym_chain_bones_00: IntProperty(name="C00", default=6, min=1, max=64)
+    asym_chain_bones_01: IntProperty(name="C01", default=6, min=1, max=64)
+    asym_chain_bones_02: IntProperty(name="C02", default=6, min=1, max=64)
+    asym_chain_bones_03: IntProperty(name="C03", default=6, min=1, max=64)
+    asym_chain_bones_04: IntProperty(name="C04", default=6, min=1, max=64)
+    asym_chain_bones_05: IntProperty(name="C05", default=6, min=1, max=64)
+    asym_chain_bones_06: IntProperty(name="C06", default=6, min=1, max=64)
+    asym_chain_bones_07: IntProperty(name="C07", default=6, min=1, max=64)
+    asym_chain_bones_08: IntProperty(name="C08", default=6, min=1, max=64)
+    asym_chain_bones_09: IntProperty(name="C09", default=6, min=1, max=64)
     rows: IntProperty(
         name="纵向层数",
         default=6,
@@ -4640,10 +6363,50 @@ class AUTOSKIRT_PT_main(bpy.types.Panel):
         option_box = layout.box()
         option_box.label(text="生成选项")
         option_box.prop(settings, "prefix")
-        option_box.prop(settings, "use_lr_suffix_names")
         option_box.prop(settings, "skirt_shape_mode")
-        option_box.prop(settings, "rows")
-        option_box.prop(settings, "columns")
+        if settings.skirt_shape_mode == 'ASYMMETRIC':
+            option_box.prop(settings, "asym_control_chain_count")
+            chain_row = option_box.row()
+            chain_row.alert = settings.columns < settings.asym_control_chain_count
+            chain_row.prop(settings, "columns")
+            option_box.prop(settings, "asym_default_bone_count")
+
+            count_box = option_box.box()
+            count_box.label(text="每条控制点链骨骼数")
+            cardinal = ("Front", "Right", "Back", "Left")
+            chain_count = int(settings.asym_control_chain_count)
+            for chain in range(chain_count):
+                value = chain * 4.0 / chain_count
+                segment = int(math.floor(value)) % 4
+                fraction = value - math.floor(value)
+                if fraction <= 1.0e-5:
+                    region = cardinal[segment]
+                else:
+                    region = f"{cardinal[segment]}→{cardinal[(segment + 1) % 4]}"
+                row = count_box.row(align=True)
+                row.label(text=f"C{chain:02d}  {region}")
+                row.prop(
+                    settings,
+                    _asym_count_property_name(chain),
+                    text="",
+                )
+            batch = count_box.row(align=True)
+            batch.operator(
+                AUTOSKIRT_OT_auto_asym_bone_counts.bl_idname,
+                text="自动计算",
+            )
+            batch.operator(
+                AUTOSKIRT_OT_uniform_asym_bone_counts.bl_idname,
+                text="全部相同",
+            )
+            batch.operator(
+                AUTOSKIRT_OT_reset_asym_bone_counts.bl_idname,
+                text="恢复默认",
+            )
+        else:
+            option_box.prop(settings, "use_lr_suffix_names")
+            option_box.prop(settings, "rows")
+            option_box.prop(settings, "columns")
         option_box.prop(settings, "create_proxy_mesh")
 
         if settings.control_edit_active:
@@ -4695,6 +6458,9 @@ classes = (
     AUTOSKIRT_OT_finish_control_edit,
     AUTOSKIRT_OT_cancel_control_edit,
     AUTOSKIRT_OT_reset_control_edit,
+    AUTOSKIRT_OT_auto_asym_bone_counts,
+    AUTOSKIRT_OT_uniform_asym_bone_counts,
+    AUTOSKIRT_OT_reset_asym_bone_counts,
     AUTOSKIRT_OT_build,
     AUTOSKIRT_OT_delete_controls,
     AUTOSKIRT_OT_delete_bones_groups,

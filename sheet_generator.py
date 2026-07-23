@@ -16,7 +16,7 @@ from mathutils.bvhtree import BVHTree
 
 LEVELS = 4
 CONTROL_CHAIN_COLORS = (
-    (1.0, 0.18, 0.08, 1.0),
+    (0.78, 1.00, 0.10, 1.0),
     (0.10, 0.90, 0.24, 1.0),
     (0.10, 0.42, 1.0, 1.0),
     (0.86, 0.16, 1.0, 1.0),
