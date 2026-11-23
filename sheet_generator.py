@@ -245,6 +245,12 @@ def collect_components(mesh_obj):
             adjacency[a].add(b)
             adjacency[b].add(a)
 
+    faces_by_vertex = {}
+    for face in bm.faces:
+        ids = tuple(v.index for v in face.verts)
+        if all(i in selected for i in ids):
+            faces_by_vertex.setdefault(ids[0], []).append(ids)
+
     components = []
     remaining = set(selected)
     while remaining:
@@ -267,6 +273,7 @@ def collect_components(mesh_obj):
             "mesh": mesh_obj.name,
             "indices": sorted(indices),
             "records": records,
+            "faces": [face for i in indices for face in faces_by_vertex.get(i, ())],
             "tip_point": detect_free_end_tip(
                 indices, selected, adjacency, mesh_obj
             ),

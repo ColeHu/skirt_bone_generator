@@ -63,6 +63,9 @@ def exercise(kind, n, levels, bind=True, proxy=True, axes=("X",)):
     s.skirt_type = "CLOSED" if closed else "OPEN"
     s.asym_control_chain_count, s.control_levels = n, levels
     next_step, back = bpy.ops.auto_skirt.workflow_next, bpy.ops.auto_skirt.workflow_back
+    if not closed:
+        cloth[addon.sheet_generator.PROP_COLLECTION] = "Missing collection from a previous prefix"
+        cloth[addon.sheet_generator.PROP_PREFIX] = "Previous_"
     if kind == "flat":
         try:
             next_step()
@@ -96,7 +99,7 @@ def exercise(kind, n, levels, bind=True, proxy=True, axes=("X",)):
         origin, tip = normal_lines[(i*levels+j)*6:(i*levels+j)*6+2]
         reference = Vector((origin.x, origin.y, 0)) if closed else cloth.data.polygons[len(cloth.data.polygons)//2].normal
         assert (tip-origin).dot(reference) > 0, (kind, i, "outward axis")
-    selected = 1
+    selected = n-1 if n > 12 else 1
     level = levels // 2
     for chain in chains:
         for obj in chain:
@@ -176,6 +179,11 @@ def exercise(kind, n, levels, bind=True, proxy=True, axes=("X",)):
                 distances.append((row[i]-a.lerp(b, max(0, min(1, factor)))).length)
             assert min(distances) < 1e-5
     assert all(not obj.hide_get() for chain in chains for obj in chain)
+    s.prefix = "Final_"
+    arrows = [ui.generation_arrow_lines([o.matrix_world.translation for o in chain], 5,
+                                        ui._main_reverses(s)[i]) for i, chain in enumerate(chains)]
+    for count in (1, 11, 64):
+        assert len(ui.generation_arrow_lines(paths["C00"], count, False)) == 10 * count
     before = set(ctx.scene.objects)
     assert next_step() == {"FINISHED"} and ui.workflow_stage(ctx) == 1
     assert all(obj.hide_get() for chain in chains for obj in chain)
@@ -187,6 +195,10 @@ def exercise(kind, n, levels, bind=True, proxy=True, axes=("X",)):
             rail.reverse()
         for j in range(5):
             b = rig.data.bones[f"{s.prefix}C{i:02d}_R{j:02d}"]
+            assert len(arrows[i]) == 50
+            shaft, tip = arrows[i][10*j:10*j+2]
+            direction = (rig.matrix_world @ b.tail_local) - (rig.matrix_world @ b.head_local)
+            assert (tip-shaft).normalized().dot(direction.normalized()) > 0.9999
             assert (rig.matrix_world @ b.head_local - rail[j]).length < 1e-4
             assert (rig.matrix_world @ b.tail_local - rail[j+1]).length < 1e-4
     proxies = [obj for obj in ctx.scene.objects if obj not in before and obj.type == "MESH"]
@@ -207,7 +219,8 @@ CASES = [('skirt',4,2,True,True,('X','Y')), ('skirt',7,7,True,False,('X',)),
          ('pleats',12,32,True,True,('Y',)), ('cape',5,6,True,True,('X',)),
          ('apron',6,3,False,True,('X',)), ('tip',9,8,True,True,('X',)),
          ('narrow',8,4,False,False,('Y',)), ('flat',6,4), ('skirt',10,4,False,True,('X','Y')),
-         ('cape',11,9,True,False,('X',))]
+         ('cape',11,9,True,False,('X',)), ('skirt',24,4,True,True,('X','Y')),
+         ('cape',24,5,True,True,('X',)), ('skirt',23,4,True,False,('X',))]
 
 
 if __name__ == '__main__':

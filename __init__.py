@@ -4,7 +4,7 @@
 bl_info = {
     "name": "裙子骨骼生成器",
     "author": "Akazure",
-    "version": (2, 0, 0),
+    "version": (2, 0, 1),
     "blender": (4, 5, 0),
     "location": "3D 视图 > 右侧边栏 > 自动裙骨",
     "description": "根据控制点生成裙子骨骼",
@@ -1450,6 +1450,7 @@ def _draw_control_edit_selection_markers():
                 shader, 'POINTS', {"pos": selection_positions}
             ).draw(shader)
         gpu.state.point_size_set(15.0)
+        reverses = unified_generator._main_reverses(settings) if reviewing else []
         for chain_key, positions in control_chains.items():
             if not positions:
                 continue
@@ -1465,6 +1466,13 @@ def _draw_control_edit_selection_markers():
                 for index in range(len(positions) - 1):
                     chain_lines.extend((positions[index], positions[index + 1]))
                 batch_for_shader(shader, 'LINES', {"pos": chain_lines}).draw(shader)
+                if reviewing:
+                    arrows = unified_generator.generation_arrow_lines(
+                        positions, settings.asym_default_bone_count, reverses[int(chain_key[1:])]
+                    )
+                    if arrows:
+                        gpu.state.line_width_set(2.8)
+                        batch_for_shader(shader, 'LINES', {"pos": arrows}).draw(shader)
     except (ReferenceError, RuntimeError, ValueError, KeyError):
         # A viewport may be closing or the edit session may be incomplete.
         pass
@@ -2076,7 +2084,7 @@ def _fit_variable_asymmetric_control_positions(
     follow the fitted hem, so an asymmetric skirt keeps useful initial chain
     lengths while the top view remains a regular circle.
     """
-    chain_count = int(clamp(chain_count, 4, 12))
+    chain_count = int(clamp(chain_count, 4, 24))
     profile = _fit_smooth_hem_profile(records, armature_obj)
     points = [item["world"].copy() for item in records]
     center = Vector(profile["center"])
@@ -2133,6 +2141,7 @@ def _create_or_update_asymmetric_controls(
 ):
     collection_name = _control_collection_name(settings.prefix, mesh_obj.name)
     collection = get_or_create_collection(collection_name)
+    collection["control_prefix"] = settings.prefix
     collection["control_levels"] = len(controls[0])
     existing = find_control_points(collection, settings.prefix, require_all=False)
     if update_existing and (
@@ -2286,6 +2295,9 @@ def generate_control_points(context, settings):
 
     settings.target_mesh = primary_mesh
     old_prefix = str(primary_mesh.get(PROP_PREFIX, settings.prefix))
+    previous = bpy.data.collections.get(str(primary_mesh.get(PROP_COLLECTION, "")))
+    if previous is not None:
+        old_prefix = previous.get("control_prefix", old_prefix)
     for prefix in {old_prefix, settings.prefix}:
         delete_generated_controls(prefix, primary_mesh.name)
     collection = create_controls(primary_mesh, settings, controls, display_size, update_existing=False)
@@ -2367,6 +2379,8 @@ def _refit_control_points(context, settings):
 
 
 def find_control_points(collection, prefix, require_all=True):
+    if collection is not None:
+        prefix = collection.get("control_prefix", prefix)
     dynamic = []
     if collection is not None:
         dynamic = [
@@ -5109,8 +5123,8 @@ def build_variable_asymmetric_data(
     settings,
     anchor_bone_counts,
 ):
-    if not 4 <= len(control_points) <= 12:
-        raise ValueError("不对称控制点链数必须在 4 到 12 之间")
+    if not 4 <= len(control_points) <= 24:
+        raise ValueError("不对称控制点链数必须在 4 到 24 之间")
     if int(settings.columns) < len(control_points):
         raise ValueError("骨骼链数不能少于控制点链数")
     profile = _fit_smooth_hem_profile(
@@ -5951,7 +5965,7 @@ def _update_asym_control_chain_count(settings, context):
     if not _controls_are_asymmetric(controls) or not controls:
         return
     old_count = len(controls)
-    new_count = int(clamp(settings.asym_control_chain_count, 4, 12))
+    new_count = int(clamp(settings.asym_control_chain_count, 4, 24))
     if old_count == new_count:
         return
 
@@ -6010,7 +6024,7 @@ def _update_asym_control_chain_count(settings, context):
 class AUTOSKIRT_OT_generate_control_points(bpy.types.Operator):
     bl_idname = "auto_skirt.generate_control_points"
     bl_label = "生成控制点"
-    bl_description = "根据编辑模式选区生成标准四向控制点或 4–12 条不对称控制链"
+    bl_description = "根据编辑模式选区生成标准四向控制点或 4–24 条不对称控制链"
     bl_options = {'REGISTER', 'UNDO'}
 
     def execute(self, context):
@@ -6350,7 +6364,7 @@ class AUTOSKIRT_PG_settings(bpy.types.PropertyGroup):
         name="裙摆类型",
         items=(
             ('STANDARD', "标准裙摆", "使用原有稳定的闭合裙摆算法"),
-            ('ASYMMETRIC', "不对称裙摆", "4–12 条可编辑控制链，每条链可设置独立骨骼数"),
+            ('ASYMMETRIC', "不对称裙摆", "4–24 条可编辑控制链，每条链可设置独立骨骼数"),
         ),
         default='STANDARD',
     )
@@ -6363,7 +6377,7 @@ class AUTOSKIRT_PG_settings(bpy.types.PropertyGroup):
         name="控制点链数",
         default=6,
         min=4,
-        max=12,
+        max=24,
         description="不对称裙摆的环向控制链数量；修改后从当前控制笼重采样",
         update=_update_asym_control_chain_count,
     )
@@ -6388,7 +6402,7 @@ class AUTOSKIRT_PG_settings(bpy.types.PropertyGroup):
         name="纵向层数",
         default=6,
         min=2,
-        max=128,
+        max=248,
     )
     columns: IntProperty(
         name="骨骼链数",

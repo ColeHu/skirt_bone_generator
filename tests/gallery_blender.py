@@ -123,6 +123,15 @@ def exercise(cloth, rig, closed, n, levels, index):
     ui=addon.unified_generator
     _,chains,_=ui._current_control_chains(ctx)
     assert len(chains)==n and all(len(chain)==levels for chain in chains)
+    if CASES[index-1][1] == "horseshoe":
+        # The 40-column fixture sweeps 270 degrees. Compare the entire top rail
+        # against the known fabric arc, including the two opening corners.
+        top = [cloth.matrix_world @ v.co for v in cloth.data.vertices[:40]]
+        targets = addon.sheet_generator.resample_polyline(top, n)
+        roots = [chain[0].matrix_world.translation for chain in chains]
+        if (roots[0]-targets[-1]).length < (roots[0]-targets[0]).length:
+            targets.reverse()
+        assert max((root-target).length for root,target in zip(roots,targets)) < 1e-4
     edit=st if closed else ctx.scene.auto_sheet_settings
     snap=addon._parse_json_dict(edit.control_edit_snapshot if closed else edit.edit_snapshot)
     for chain in chains:

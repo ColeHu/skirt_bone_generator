@@ -36,6 +36,12 @@ CHAIN_COLORS = (
     (0.94, 0.54, 0.96, 1.0),
     (0.44, 0.96, 0.88, 1.0),
     (0.96, 0.94, 0.62, 1.0),
+    (1.00, 0.40, 0.32, 1.0), (0.98, 0.68, 0.30, 1.0),
+    (0.73, 0.94, 0.16, 1.0), (0.28, 0.90, 0.40, 1.0),
+    (0.12, 0.84, 0.78, 1.0), (0.35, 0.68, 0.98, 1.0),
+    (0.42, 0.38, 0.95, 1.0), (0.69, 0.32, 0.96, 1.0),
+    (0.90, 0.32, 0.78, 1.0), (1.00, 0.47, 0.62, 1.0),
+    (0.95, 0.65, 0.52, 1.0), (0.65, 0.84, 0.48, 1.0),
 )
 
 _M = None
@@ -437,9 +443,68 @@ def _inverse_cumulative(cumulative, value):
     return (low + factor) / max(len(cumulative) - 1, 1)
 
 
+def _quad_strip_rows(component, width_axis):
+    """Recover the rectangular quad lattice without relying on vertex numbering."""
+    faces = component.get("faces", ())
+    if not faces or any(len(face) != 4 for face in faces):
+        return None
+    points = {r["index"]: r["world"] for r in component["records"]}
+    neighbors = {i: set() for i in points}
+    edges = {}
+    for face in faces:
+        for a, b in zip(face, face[1:] + face[:1]):
+            edge = (min(a, b), max(a, b))
+            edges[edge] = edges.get(edge, 0) + 1
+            neighbors[a].add(b)
+            neighbors[b].add(a)
+    boundary = {}
+    for (a, b), count in edges.items():
+        if count > 2:
+            return None
+        if count == 1:
+            boundary.setdefault(a, []).append(b)
+            boundary.setdefault(b, []).append(a)
+    corners = {i for i in boundary if len(neighbors[i]) == 2}
+    if len(corners) != 4 or any(len(adj) != 2 for adj in boundary.values()):
+        return None
+    start = min(corners)
+    previous, current = start, boundary[start][0]
+    sides, side = [], [start]
+    visited = {start}
+    while current not in visited:
+        visited.add(current)
+        side.append(current)
+        if current in corners:
+            sides.append(side)
+            side = [current]
+        a, b = boundary[current]
+        previous, current = current, b if a == previous else a
+    sides.append(side + [start])
+    if current != start or len(visited) != len(boundary) or len(sides) != 4:
+        return None
+    z = [sum(points[i].z for i in side) / len(side) for side in sides]
+    top = max(range(4), key=lambda k: z[k] - z[(k + 2) % 4])
+    row = sides[top]
+    if (points[row[-1]] - points[row[0]]).dot(width_axis) < 0:
+        row = row[::-1]
+    rows = []
+    used = set()
+    while True:
+        if len(set(row)) != len(row) or any(b not in neighbors[a] for a, b in zip(row, row[1:])):
+            return None
+        rows.append([points[i] for i in row])
+        used.update(row)
+        if len(used) == len(points):
+            return rows if set(row) == set(sides[(top + 2) % 4]) else None
+        choices = [neighbors[i] - used for i in row]
+        if any(len(options) != 1 for options in choices):
+            return None
+        row = [next(iter(options)) for options in choices]
+
+
 def _fit_open_region_grid(components, chain_count=4, levels=4):
     """Fit K open control chains at average horizontal arc-length positions."""
-    chain_count = int(_clamp(chain_count, 4, 12))
+    chain_count = int(_clamp(chain_count, 4, 24))
     records = [record for component in components for record in component["records"]]
     if len(records) < 4:
         raise ValueError("至少需要 4 个有效顶点来拟合曲面控制网格")
@@ -452,6 +517,15 @@ def _fit_open_region_grid(components, chain_count=4, levels=4):
         raise ValueError("选区横向宽度过小，无法生成控制链")
     if top - bottom <= _S.EPS:
         raise ValueError("选区缺少从上到下的高度差")
+
+    if len(components) == 1:
+        rows = _quad_strip_rows(components[0], axis)
+        if rows:
+            # Follow each fabric cross-section around bends, keeping both free edges.
+            sections = [_S.resample_polyline(row, chain_count) for row in rows]
+            rails = [_S.resample_polyline(rail, levels) for rail in zip(*sections)]
+            radius = max((r["world"] - center).length for r in records)
+            return list(map(list, zip(*rails))), max(radius * 0.04, (top - bottom) * 0.015, 0.002)
 
     parameters = []
     for record, projection in zip(records, projections):
@@ -510,13 +584,16 @@ def _fit_open_region_grid(components, chain_count=4, levels=4):
 
 
 def _sheet_create_controls(primary, settings, region_grids, display_size):
-    old_prefix = str(primary.get(_S.PROP_PREFIX, settings.prefix))
+    previous = bpy.data.collections.get(str(primary.get(_S.PROP_COLLECTION, "")))
+    old_prefix = str(previous.get("control_prefix", primary.get(_S.PROP_PREFIX, settings.prefix)) if previous else primary.get(_S.PROP_PREFIX, settings.prefix))
     _S.delete_controls(old_prefix, primary.name)
     if old_prefix != settings.prefix:
         _S.delete_controls(settings.prefix, primary.name)
     collection = _S.get_or_create_collection(
         _S.control_collection_name(settings.prefix, primary.name)
     )
+    primary[_S.PROP_COLLECTION] = collection.name
+    collection["control_prefix"] = settings.prefix
     collection["control_levels"] = len(region_grids[0])
     for region, grid in enumerate(region_grids):
         for row in range(len(grid)):
@@ -614,7 +691,7 @@ def _sheet_restore_positions(grids, raw):
 
 
 def _interpolate_open_curve(points, value):
-    """Open centripetal Catmull-Rom through any 4–12 control points."""
+    """Open centripetal Catmull-Rom through any 4–24 control points."""
     count = len(points)
     if count < 2:
         raise ValueError("横向控制曲线至少需要 2 个控制点")
@@ -921,8 +998,8 @@ def _sheet_validate_build(context, settings):
         raise ValueError("请选择有效的父骨骼")
     if settings.parent_bone.startswith(settings.prefix):
         raise ValueError("父骨骼不能使用生成骨骼前缀")
-    if int(settings.control_chain_count) < 4 or int(settings.control_chain_count) > 12:
-        raise ValueError("控制点链数必须在 4 到 12 之间")
+    if int(settings.control_chain_count) < 4 or int(settings.control_chain_count) > 24:
+        raise ValueError("控制点链数必须在 4 到 24 之间")
     if int(settings.chains) < int(settings.control_chain_count):
         raise ValueError("骨骼链数不能少于控制点链数")
     grids, _collection = _sheet_find_controls(primary, settings.prefix, require=True)
@@ -1366,6 +1443,24 @@ def _chain_direction_arrow_geometry(chain, reverse_direction=False):
         default=0.0,
     )
     size = max(0.005, min(total * 0.12, max(display_size * 2.2, total * 0.05)))
+    return _arrow_lines(tip, tangent, size)
+
+
+def generation_arrow_lines(points, bone_count, reverse):
+    """Place one arrow on each chord used by the generated bone chain."""
+    joints = _S.resample_polyline(points, bone_count + 1)
+    if reverse:
+        joints.reverse()
+    lines = []
+    for head, tail in zip(joints, joints[1:]):
+        delta = tail - head
+        length = delta.length
+        if length > 1.0e-10:
+            lines.extend(_arrow_lines(head.lerp(tail, 0.66), delta / length, length * 0.26))
+    return lines
+
+
+def _arrow_lines(tip, tangent, size):
     reference = Vector((0.0, 0.0, 1.0))
     if abs(tangent.dot(reference)) > 0.9:
         reference = Vector((1.0, 0.0, 0.0))
@@ -1460,7 +1555,7 @@ def _update_control_chain_count(settings, context):
     global _CHAIN_RESAMPLE_GUARD
     if _CHAIN_RESAMPLE_GUARD or context is None or context.scene is None:
         return
-    new_count = int(_clamp(settings.asym_control_chain_count, 4, 12))
+    new_count = int(_clamp(settings.asym_control_chain_count, 4, 24))
     if _uses_open_surface(settings):
         sheet = getattr(context.scene, "auto_sheet_settings", None)
         if sheet is None:
@@ -1470,7 +1565,7 @@ def _update_control_chain_count(settings, context):
         if primary is not None and int(primary.get(PROP_SCHEMA, 0)) == SCHEMA_VERSION:
             grids, _collection = _sheet_find_controls(primary, sheet.prefix, require=False)
         old_count = len(grids[0][0]) if grids and grids[0] else int(sheet.control_chain_count)
-        old_count = int(_clamp(old_count, 4, 12))
+        old_count = int(_clamp(old_count, 4, 24))
         old_counts = _main_counts(settings, old_count)
         old_reverses = _main_reverses(settings, old_count)
         new_counts = _resample_open_values(old_counts, new_count)
@@ -2249,7 +2344,7 @@ def _sync_common_to_sheet(context):
     """Copy the single public settings model into the legacy open-surface core."""
     main = context.scene.auto_skirt_settings
     sheet = context.scene.auto_sheet_settings
-    chain_count = int(_clamp(main.asym_control_chain_count, 4, 12))
+    chain_count = int(_clamp(main.asym_control_chain_count, 4, 24))
     sheet.target_armature = main.target_armature
     sheet.parent_bone = main.parent_bone
     sheet.bone_collection = main.bone_collection
@@ -2610,9 +2705,8 @@ class AUTOSKIRT_OT_workflow_next(bpy.types.Operator):
                 rig = main.target_armature
                 if rig is None or rig.name not in context.view_layer.objects or not rig.data.bones.get(main.parent_bone):
                     raise ValueError("请选择当前视图层中的目标骨架及其父骨骼")
-                _M._validate_prefix(main.prefix)
-                if main.parent_bone.startswith(main.prefix):
-                    raise ValueError("父骨骼不能使用生成骨骼的命名前缀")
+                if not main.prefix.strip():
+                    main.property_unset("prefix")
                 if context.mode != "EDIT_MESH":
                     raise ValueError("请在网格编辑模式选择裙摆顶点")
                 main.workflow_enabled = True
@@ -2629,6 +2723,7 @@ class AUTOSKIRT_OT_workflow_next(bpy.types.Operator):
                 else:
                     outcome = bpy.ops.auto_skirt.finish_control_edit()
                 if outcome == {'FINISHED'}:
+                    main["edit_stage_prefix"] = main.prefix
                     main.workflow_stage = 3
             else:
                 if main.workflow_enabled:
@@ -2650,7 +2745,13 @@ class AUTOSKIRT_OT_workflow_back(bpy.types.Operator):
     def execute(self, context):
         main = context.scene.auto_skirt_settings
         stage = workflow_stage(context)
+        if stage in (2, 3) and context.mode != 'OBJECT':
+            if not bpy.ops.object.mode_set.poll():
+                self.report({'ERROR'}, "请先退出当前物体的编辑模式")
+                return {'CANCELLED'}
+            bpy.ops.object.mode_set(mode='OBJECT')
         if stage == 3:
+            main.prefix = main.get("edit_stage_prefix", main.prefix)
             outcome = _edit_execute(self, context)
             if outcome == {'FINISHED'}:
                 for key in ("asym_default_bone_count", "create_proxy_mesh", "bind_weights"):
@@ -2671,13 +2772,16 @@ class AUTOSKIRT_OT_workflow_back(bpy.types.Operator):
                 edit.property_unset(key)
             main.property_unset("show_mesh_points")
             _set_main_reverses(main, [False] * main.asym_control_chain_count)
+            main.workflow_stage = 1
+            for obj in list(context.selected_objects):
+                obj.select_set(False)
             for obj in targets or [primary]:
                 if obj and obj.name in context.view_layer.objects:
                     obj.select_set(True)
-            if primary:
+            if primary and primary.name in context.view_layer.objects:
                 context.view_layer.objects.active = primary
-                bpy.ops.object.mode_set(mode='EDIT')
-            main.workflow_stage = 1
+                if bpy.ops.object.mode_set.poll():
+                    bpy.ops.object.mode_set(mode='EDIT')
         return outcome
 
 
@@ -2717,7 +2821,6 @@ def workflow_panel(self, context):
         box.prop(main, "skirt_type")
         box.prop(main, "asym_control_chain_count", text="控制链数量")
         box.prop(main, "control_levels", text="每链控制点数")
-        box.prop(main, "prefix", text="骨骼前缀")
     elif stage == 2:
         sheet = context.scene.auto_sheet_settings
         edit = sheet if sheet.edit_active else main
@@ -2729,6 +2832,7 @@ def workflow_panel(self, context):
         box.prop(edit, "show_control_normals", text="显示轴向")
         box.operator("auto_skirt.reverse_selected")
     else:
+        box.prop(main, "prefix", text="骨骼前缀")
         box.prop(main, "create_proxy_mesh")
         box.prop(main, "bind_weights")
         box.prop(main, "asym_default_bone_count", text="每链骨骼数")
@@ -2957,7 +3061,7 @@ def configure(main_module, sheet_module):
         name="控制点链数",
         default=6,
         min=4,
-        max=12,
+        max=24,
         description="沿裙摆宽度或周向布置的控制链数量",
 
     )
@@ -2970,7 +3074,7 @@ def configure(main_module, sheet_module):
         default=False,
         description="显示每个控制点的目标骨骼 +Z；旋转控制点可调整扭转",
     )
-    for index in range(12):
+    for index in range(24):
         main_annotations[_chain_count_property(index)] = IntProperty(
             name=f"C{index:02d}",
             default=6,
@@ -2987,7 +3091,7 @@ def configure(main_module, sheet_module):
 
     sheet_annotations = _S.AUTOSHEET_PG_settings.__annotations__
     sheet_annotations["control_chain_count"] = IntProperty(
-        name="控制点链数", default=6, min=4, max=12
+        name="控制点链数", default=6, min=4, max=24
     )
     sheet_annotations["default_bone_count"] = IntProperty(
         name="默认每链骨骼数", default=6, min=1, max=64
@@ -2997,7 +3101,7 @@ def configure(main_module, sheet_module):
     sheet_annotations["show_control_normals"] = BoolProperty(
         name="显示自定义法向", default=False
     )
-    for index in range(12):
+    for index in range(24):
         sheet_annotations[_sheet_count_property(index)] = IntProperty(
             name=f"C{index:02d}", default=6, min=1, max=64
         )
