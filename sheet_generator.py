@@ -321,13 +321,13 @@ def width_axis(records):
     return center, axis
 
 
-def weighted_candidate_point(records, parameters, target_u, target_v, level):
+def weighted_candidate_point(records, parameters, target_u, target_v, level, levels=LEVELS):
     scored = []
     for record, (u, v) in zip(records, parameters):
         du = abs(u - target_u) / 0.22
         if level == 0:
             dv = v / 0.12
-        elif level == LEVELS - 1:
+        elif level == levels - 1:
             dv = (1.0 - v) / 0.12
         else:
             dv = abs(v - target_v) / 0.20
@@ -535,8 +535,8 @@ def enter_edit(context, settings, collection=None):
     collection = collection or found_collection
     controls = flatten_controls(grids)
     for grid in grids:
-        for row in range(LEVELS):
-            for column in range(LEVELS):
+        for row in range(len(grid)):
+            for column in range(len(grid[row])):
                 grid[row][column].color = CONTROL_CHAIN_COLORS[
                     column % len(CONTROL_CHAIN_COLORS)
                 ]
@@ -553,11 +553,13 @@ def enter_edit(context, settings, collection=None):
     _LIVE_PROXY_CACHE["signature"] = None
     if context.active_object is not None and context.active_object.mode != 'OBJECT':
         bpy.ops.object.mode_set(mode='OBJECT')
+    for obj in controls:
+        obj.hide_set(False, view_layer=context.view_layer)
     names = {obj.name for obj in controls}
     for obj in context.view_layer.objects:
         obj.hide_select = obj.name not in names
         try:
-            obj.select_set(obj.name in names)
+            obj.select_set(obj == controls[0])
         except RuntimeError:
             pass
     for obj in controls:
@@ -788,6 +790,10 @@ def live_proxy_geometry():
     return triangles, lines
 
 
+def chain_display_color(index):
+    return CONTROL_CHAIN_COLORS[index % len(CONTROL_CHAIN_COLORS)]
+
+
 def draw_markers():
     try:
         control_chains, selected = marker_positions()
@@ -818,9 +824,7 @@ def draw_markers():
         for chain_index, positions in enumerate(control_chains):
             if not positions:
                 continue
-            color = CONTROL_CHAIN_COLORS[
-                chain_index % len(CONTROL_CHAIN_COLORS)
-            ]
+            color = chain_display_color(chain_index)
             shader.uniform_float("color", color)
             batch_for_shader(shader, 'POINTS', {"pos": positions}).draw(shader)
             if len(positions) > 1:
@@ -1262,7 +1266,7 @@ def delete_proxies(prefix, primary_name):
     return removed
 
 
-def create_proxy(nodes, primary, settings, region):
+def create_proxy(nodes, primary, settings, region, bind=True):
     collection = get_or_create_collection(proxy_collection_name(settings.prefix, primary.name))
     vertices, faces, vertex_uv = proxy_topology(nodes, triangulated=False)
     data = bpy.data.meshes.new(f"{settings.prefix}PROXY_P{region:02d}_{primary.name}_Mesh")
@@ -1276,6 +1280,8 @@ def create_proxy(nodes, primary, settings, region):
     obj.hide_render = True
     obj[PROP_KIND] = KIND_PROXY
     obj["auto_sheet_target"] = primary.name
+    if not bind:
+        return obj
     indices = list(range(len(data.vertices)))
     weights = {
         index: compute_weights(uv.x, uv.y, settings, region)

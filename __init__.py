@@ -4,17 +4,31 @@
 bl_info = {
     "name": "裙子骨骼生成器",
     "author": "Akazure",
-    "version": (1, 5, 2),
+    "version": (2, 0, 0),
     "blender": (4, 5, 0),
     "location": "3D 视图 > 右侧边栏 > 自动裙骨",
     "description": "根据控制点生成裙子骨骼",
     "category": "Rigging",
 }
 
+import importlib
 import json
 import math
+import sys
 
-from . import sheet_generator
+# Blender keeps package submodules in memory when an add-on is disabled and
+# enabled again. Reload both implementation modules so unified_generator's
+# configuration guard and patched classes belong to this module generation.
+# Otherwise the panel can fall back to the obsolete skirt-type UI after reload.
+if "sheet_generator" in locals():
+    sheet_generator = importlib.reload(sheet_generator)
+else:
+    from . import sheet_generator
+
+if "unified_generator" in locals():
+    unified_generator = importlib.reload(unified_generator)
+else:
+    from . import unified_generator
 
 import bmesh
 import bpy
@@ -77,6 +91,7 @@ PROP_ASYM_BONE_COUNTS = "auto_skirt_asym_bone_counts"
 PROP_PROXY_KIND = "PROXY"
 EDIT_KIND_CONTROL = "CONTROL"
 EDIT_SNAPSHOT_EPSILON = 1.0e-7
+BONE_CHAIN_SMOOTHING_PASSES = 3
 _MIRROR_GUARD = False
 _LR_SUFFIX_NAMING_ENABLED = False
 _LR_SUFFIX_COLUMN_MAP = {}
@@ -788,7 +803,7 @@ def _select_only_controls(context, control_objects):
     control_names = {obj.name for obj in controls}
     for obj in context.view_layer.objects:
         try:
-            obj.select_set(obj.name in control_names)
+            obj.select_set(bool(controls) and obj == controls[0])
         except RuntimeError:
             pass
     if controls:
@@ -823,6 +838,8 @@ def _enter_control_edit_mode(context, settings, collection=None):
     if context.active_object is not None and context.active_object.mode != 'OBJECT':
         bpy.ops.object.mode_set(mode='OBJECT')
 
+    for obj in _flatten_control_objects(controls):
+        obj.hide_set(False, view_layer=context.view_layer)
     control_names = {obj.name for obj in _flatten_control_objects(controls)}
     for obj in context.view_layer.objects:
         if obj.name not in control_names:
@@ -886,6 +903,41 @@ def _changed_control_names(current, previous):
         if _position_delta_squared(value, previous.get(name)) > EDIT_SNAPSHOT_EPSILON:
             changed.add(name)
     return changed
+
+
+def _preferred_changed_control_name(context, controls, changed, previous):
+    """Choose the user's edited control even when a handler has stale context.
+
+    A depsgraph update can be delivered after Blender has changed the active
+    object, or after the mirror target itself has caused a second update.  The
+    old implementation then fell back to the hard-coded first item in a pair,
+    which made the mirror appear to work intermittently.  Prefer the active
+    changed control, then a sole selected changed control, and finally the
+    control with the largest local-space displacement.
+    """
+    controls_by_name = {
+        obj.name: obj for obj in _flatten_control_objects(controls)
+    }
+    active = context.active_object
+    if active is not None and active.name in changed:
+        return active.name
+
+    selected = [
+        name for name in changed
+        if name in controls_by_name and controls_by_name[name].select_get()
+    ]
+    if len(selected) == 1:
+        return selected[0]
+
+    if changed:
+        return max(
+            changed,
+            key=lambda name: _position_delta_squared(
+                list(controls_by_name[name].location),
+                previous.get(name),
+            ) if name in controls_by_name else 0.0,
+        )
+    return ""
 
 
 def _mirror_location(source, axis, center_value):
@@ -1025,11 +1077,11 @@ def _apply_dynamic_mirror_axis(
         mirrored_names.add(target_obj.name)
     return mirrored_names
 
-def _apply_control_edit_mirror(context):
+def _apply_control_edit_mirror(context, scene=None):
     global _MIRROR_GUARD
     if _MIRROR_GUARD:
         return
-    scene = context.scene
+    scene = scene or context.scene
     if scene is None or not hasattr(scene, "auto_skirt_settings"):
         return
     settings = scene.auto_skirt_settings
@@ -1050,7 +1102,9 @@ def _apply_control_edit_mirror(context):
         return
 
     centers = _snapshot_control_centers(settings.control_edit_snapshot)
-    active_name = context.active_object.name if context.active_object else ""
+    active_name = _preferred_changed_control_name(
+        context, controls, changed, previous
+    )
     _MIRROR_GUARD = True
     try:
         if _controls_are_asymmetric(controls):
@@ -1108,6 +1162,21 @@ def _apply_control_edit_mirror(context):
                     'Y',
                     center.y,
                 )
+            # Front/Back lie on the X mirror plane and Left/Right lie on the
+            # Y mirror plane.  Keep their on-plane coordinate fixed, so a
+            # move cannot silently break the enabled symmetry.
+            if settings.control_mirror_x:
+                for direction in ("Front", "Back"):
+                    obj = controls[direction][level]
+                    if obj.name in changed:
+                        obj.location.x = center.x
+                        any_changed = True
+            if settings.control_mirror_y:
+                for direction in ("Left", "Right"):
+                    obj = controls[direction][level]
+                    if obj.name in changed:
+                        obj.location.y = center.y
+                        any_changed = True
         if any_changed:
             current = _control_position_map(controls)
         settings.control_edit_last_positions = json.dumps(current, separators=(",", ":"))
@@ -1121,7 +1190,7 @@ def _auto_skirt_depsgraph_update(scene, depsgraph):
     if scene is None or not hasattr(scene, "auto_skirt_settings"):
         return
     if scene.auto_skirt_settings.control_edit_active:
-        _apply_control_edit_mirror(bpy.context)
+        _apply_control_edit_mirror(bpy.context, scene)
 
 
 def _draw_control_edit_header(self, context):
@@ -1148,7 +1217,7 @@ def _control_edit_selected_world_positions(scene):
     if scene is None or not hasattr(scene, "auto_skirt_settings"):
         return []
     settings = scene.auto_skirt_settings
-    if not settings.control_edit_active:
+    if not settings.control_edit_active or not settings.show_mesh_points:
         return []
 
     primary_mesh = bpy.data.objects.get(settings.control_edit_mesh_name)
@@ -1243,6 +1312,7 @@ def _live_proxy_signature(settings, primary_mesh, controls):
         settings.fit_mode,
         round(float(settings.ring_fit_strength), 6),
         bool(settings.longitudinal_smoothing),
+        bool(settings.smooth_bone_chains),
     ]
     if _controls_are_asymmetric(controls):
         values.append(int(settings.asym_control_chain_count))
@@ -1324,6 +1394,7 @@ def _control_edit_live_proxy_geometry(scene):
             fit_mode=settings.fit_mode,
             ring_fit_strength=settings.ring_fit_strength,
             longitudinal_smoothing=settings.longitudinal_smoothing,
+            smooth_bone_chains=settings.smooth_bone_chains,
         )
         samples = _uniform_proxy_row_samples(samples)
 
@@ -1338,9 +1409,17 @@ def _draw_control_edit_selection_markers():
     """Draw a live proxy, colored control chains and fitted target vertices."""
     try:
         scene = bpy.context.scene
-        control_chains = _control_edit_control_world_positions(scene)
-        selection_positions = _control_edit_selected_world_positions(scene)
-        proxy_triangles, proxy_lines = _control_edit_live_proxy_geometry(scene)
+        settings = scene.auto_skirt_settings
+        reviewing = settings.workflow_stage == 3 and not (
+            settings.control_edit_active or scene.auto_sheet_settings.edit_active
+        )
+        if reviewing:
+            control_chains, selection_positions, proxy = unified_generator.generation_preview(scene)
+            proxy_triangles, proxy_lines = proxy
+        else:
+            control_chains = _control_edit_control_world_positions(scene)
+            selection_positions = _control_edit_selected_world_positions(scene)
+            proxy_triangles, proxy_lines = _control_edit_live_proxy_geometry(scene)
         if not any(control_chains.values()) and not selection_positions and not proxy_lines:
             return
 
@@ -1364,12 +1443,18 @@ def _draw_control_edit_selection_markers():
             batch_for_shader(shader, 'LINES', {"pos": proxy_lines}).draw(shader)
 
         gpu.state.depth_test_set('NONE')
+        if selection_positions:
+            gpu.state.point_size_set(4.0)
+            shader.uniform_float("color", (1.0, 0.28, 0.04, 1.0))
+            batch_for_shader(
+                shader, 'POINTS', {"pos": selection_positions}
+            ).draw(shader)
         gpu.state.point_size_set(15.0)
         for chain_key, positions in control_chains.items():
             if not positions:
                 continue
             color = (
-                _asym_control_color(int(chain_key[1:]))
+                unified_generator.display_color(int(chain_key[1:]))
                 if chain_key.startswith("C")
                 else CONTROL_CHAIN_COLORS[chain_key]
             )
@@ -1380,12 +1465,6 @@ def _draw_control_edit_selection_markers():
                 for index in range(len(positions) - 1):
                     chain_lines.extend((positions[index], positions[index + 1]))
                 batch_for_shader(shader, 'LINES', {"pos": chain_lines}).draw(shader)
-        if selection_positions:
-            gpu.state.point_size_set(8.0)
-            shader.uniform_float("color", (1.0, 0.28, 0.04, 1.0))
-            batch_for_shader(
-                shader, 'POINTS', {"pos": selection_positions}
-            ).draw(shader)
     except (ReferenceError, RuntimeError, ValueError, KeyError):
         # A viewport may be closing or the edit session may be incomplete.
         pass
@@ -1997,7 +2076,7 @@ def _fit_variable_asymmetric_control_positions(
     follow the fitted hem, so an asymmetric skirt keeps useful initial chain
     lengths while the top view remains a regular circle.
     """
-    chain_count = int(clamp(chain_count, 4, 10))
+    chain_count = int(clamp(chain_count, 4, 12))
     profile = _fit_smooth_hem_profile(records, armature_obj)
     points = [item["world"].copy() for item in records]
     center = Vector(profile["center"])
@@ -2054,6 +2133,7 @@ def _create_or_update_asymmetric_controls(
 ):
     collection_name = _control_collection_name(settings.prefix, mesh_obj.name)
     collection = get_or_create_collection(collection_name)
+    collection["control_levels"] = len(controls[0])
     existing = find_control_points(collection, settings.prefix, require_all=False)
     if update_existing and (
         not _controls_are_asymmetric(existing)
@@ -2065,7 +2145,7 @@ def _create_or_update_asymmetric_controls(
         )
 
     for chain, chain_points in enumerate(controls):
-        for level in range(CONTROL_LEVELS):
+        for level in range(len(chain_points)):
             name = _asym_control_name(settings.prefix, chain, level)
             obj = bpy.data.objects.get(name)
             if obj is None or obj.get(PROP_TARGET) != mesh_obj.name:
@@ -2186,46 +2266,31 @@ def generate_control_points(context, settings):
         combined_records.extend(records)
 
     primary_mesh = mesh_objects[0]
-    settings.target_mesh = primary_mesh
     _validate_prefix(settings.prefix)
-    old_prefix = str(primary_mesh.get(PROP_PREFIX, settings.prefix))
-    delete_generated_controls(old_prefix, primary_mesh.name)
-    if old_prefix != settings.prefix:
-        delete_generated_controls(settings.prefix, primary_mesh.name)
-
-    if settings.skirt_shape_mode == 'ASYMMETRIC':
-        controls, display_size, _profile = (
-            _fit_variable_asymmetric_control_positions(
-                combined_records,
-                settings.target_armature,
-                settings.asym_control_chain_count,
-                settings.bone_inset,
-            )
+    asymmetric = settings.skirt_shape_mode == 'ASYMMETRIC'
+    if asymmetric:
+        controls, display_size, profile = _fit_variable_asymmetric_control_positions(
+            combined_records, settings.target_armature, settings.asym_control_chain_count,
+            settings.bone_inset,
         )
+        if settings.workflow_enabled:
+            controls = unified_generator.fit_closed_rails(
+                combined_records, controls, profile, settings.control_levels
+            )
         _auto_asym_anchor_bone_counts(settings, controls)
         settings.columns = max(settings.columns, len(controls))
-        collection = _create_or_update_asymmetric_controls(
-            primary_mesh,
-            settings,
-            controls,
-            display_size,
-            update_existing=False,
-        )
-        if PROP_ASYM_BASE_L3 in primary_mesh:
-            del primary_mesh[PROP_ASYM_BASE_L3]
+        create_controls = _create_or_update_asymmetric_controls
     else:
-        controls, display_size = _fit_control_positions(
-            combined_records, settings.target_armature
-        )
-        if PROP_ASYM_BASE_L3 in primary_mesh:
-            del primary_mesh[PROP_ASYM_BASE_L3]
-        collection = _create_or_update_controls(
-            primary_mesh,
-            settings,
-            controls,
-            display_size,
-            update_existing=False,
-        )
+        controls, display_size = _fit_control_positions(combined_records, settings.target_armature)
+        create_controls = _create_or_update_controls
+
+    settings.target_mesh = primary_mesh
+    old_prefix = str(primary_mesh.get(PROP_PREFIX, settings.prefix))
+    for prefix in {old_prefix, settings.prefix}:
+        delete_generated_controls(prefix, primary_mesh.name)
+    collection = create_controls(primary_mesh, settings, controls, display_size, update_existing=False)
+    if PROP_ASYM_BASE_L3 in primary_mesh:
+        del primary_mesh[PROP_ASYM_BASE_L3]
     for mesh_obj, records in records_by_mesh:
         _store_selection_records(mesh_obj, records)
         _store_mesh_metadata(mesh_obj, settings, collection.name, mesh_objects)
@@ -2315,21 +2380,22 @@ def find_control_points(collection, prefix, require_all=True):
         chain_count = max(
             int(obj.get("auto_skirt_chain_index", -1)) for obj in dynamic
         ) + 1
-        result = [[None] * CONTROL_LEVELS for _chain in range(chain_count)]
+        level_count = int(collection.get("control_levels", 4))
+        result = [[None] * level_count for _chain in range(chain_count)]
         for obj in dynamic:
             chain = int(obj.get("auto_skirt_chain_index", -1))
             level = int(obj.get("auto_skirt_level", -1))
-            if 0 <= chain < chain_count and 0 <= level < CONTROL_LEVELS:
+            if 0 <= chain < chain_count and 0 <= level < level_count:
                 result[chain][level] = obj
         missing = [
             _asym_control_name(prefix, chain, level)
             for chain in range(chain_count)
-            for level in range(CONTROL_LEVELS)
+            for level in range(level_count)
             if result[chain][level] is None
         ]
         if require_all and missing:
             raise ValueError(
-                f"不对称控制点不完整（需要 {chain_count * CONTROL_LEVELS} 个）；缺少："
+                f"不对称控制点不完整（需要 {chain_count * level_count} 个）；缺少："
                 + ", ".join(missing[:6])
             )
         return result
@@ -2373,11 +2439,11 @@ def interpolate_vertical_control(direction_points, v):
     instead of an overshooting cubic spline, so results remain inside each pair
     of neighboring controls.
     """
-    if len(direction_points) != CONTROL_LEVELS:
-        raise ValueError("每个方向必须恰好包含 4 个控制点")
+    if len(direction_points) < 2:
+        raise ValueError("每条控制链至少需要两个控制点")
     v = clamp(float(v), 0.0, 1.0)
-    scaled = v * (CONTROL_LEVELS - 1)
-    segment = min(int(math.floor(scaled)), CONTROL_LEVELS - 2)
+    scaled = v * (len(direction_points) - 1)
+    segment = min(int(math.floor(scaled)), len(direction_points) - 2)
     factor = smoothstep(scaled - segment)
     return Vector(direction_points[segment]).lerp(
         Vector(direction_points[segment + 1]), factor
@@ -2704,6 +2770,51 @@ def _smooth_normal_triplet(previous, current, following):
     )
 
 
+def _smooth_bone_chain_grid(
+    samples,
+    normals,
+    control_points,
+    columns,
+    bone_inset,
+    closed_loop,
+    passes=BONE_CHAIN_SMOOTHING_PASSES,
+):
+    """Filter each vertical bone chain, preserving its first and last joint."""
+    rows = len(samples)
+    if rows < 3:
+        return samples, normals
+    result = [[Vector(point).copy() for point in row] for row in samples]
+    normal_result = [[Vector(normal).copy() for normal in row] for row in normals]
+    for _pass in range(max(int(passes), 1)):
+        previous_points = result
+        previous_normals = normal_result
+        result = [[point.copy() for point in row] for row in previous_points]
+        normal_result = [[normal.copy() for normal in row] for row in previous_normals]
+        for row in range(1, rows - 1):
+            row_v = row / (rows - 1)
+            for column in range(columns):
+                point = (
+                    previous_points[row - 1][column] * 0.25
+                    + previous_points[row][column] * 0.50
+                    + previous_points[row + 1][column] * 0.25
+                )
+                result[row][column] = _clamp_point_to_cage(
+                    point,
+                    control_points,
+                    row_v,
+                    column,
+                    columns,
+                    bone_inset,
+                    closed_loop,
+                )
+                normal_result[row][column] = _smooth_normal_triplet(
+                    previous_normals[row - 1][column],
+                    previous_normals[row][column],
+                    previous_normals[row + 1][column],
+                )
+    return result, normal_result
+
+
 def sample_cage_row(
     control_points,
     row_v,
@@ -2820,6 +2931,7 @@ def build_cage_samples(
     fit_mode='OUTER_ENVELOPE',
     ring_fit_strength=1.0,
     longitudinal_smoothing=True,
+    smooth_bone_chains=False,
     return_normals=False,
 ):
     if rows < 2:
@@ -2889,6 +3001,16 @@ def build_cage_samples(
                 )
         samples = smoothed_samples
         normals = smoothed_normals
+
+    if smooth_bone_chains:
+        samples, normals = _smooth_bone_chain_grid(
+            samples,
+            normals,
+            control_points,
+            columns,
+            bone_inset,
+            closed_loop,
+        )
 
     if return_normals:
         return samples, normals
@@ -3046,6 +3168,23 @@ def _equal_chord_chain(polyline, bone_count):
             for index in range(bone_count + 1)
         ]
     return chain
+
+
+def _smooth_open_bone_chain(points, passes=BONE_CHAIN_SMOOTHING_PASSES):
+    """Smooth generated joint positions without moving either chain endpoint."""
+    result = [Vector(point).copy() for point in points]
+    if len(result) < 3:
+        return result
+    for _pass in range(max(int(passes), 1)):
+        previous = result
+        result = [point.copy() for point in previous]
+        for index in range(1, len(previous) - 1):
+            result[index] = (
+                previous[index - 1] * 0.25
+                + previous[index] * 0.50
+                + previous[index + 1] * 0.25
+            )
+    return result
 
 
 def _interpolate_vector_on_polyline(points, vectors, target, fallback):
@@ -4610,7 +4749,7 @@ def apply_asymmetric_proxy_weights(
     return assignments
 
 
-def _variable_asym_ring_point(control_points, level, raw_u):
+def _variable_asym_ring_point_linear(control_points, level, raw_u):
     count = len(control_points)
     if count < 2:
         raise ValueError("不对称裙摆至少需要 4 条控制链")
@@ -4623,6 +4762,71 @@ def _variable_asym_ring_point(control_points, level, raw_u):
         factor,
     )
 
+
+_VARIABLE_ASYM_FRAME_CACHE = {
+    "source": None,
+    "frame": None,
+}
+
+
+def _variable_asym_control_frame(control_points):
+    """Return stable centers and a height axis for the closed control cage."""
+    if _VARIABLE_ASYM_FRAME_CACHE["source"] is control_points:
+        return _VARIABLE_ASYM_FRAME_CACHE["frame"]
+
+    centers = [
+        _average_points([Vector(chain[level]) for chain in control_points])
+        for level in range(CONTROL_LEVELS)
+    ]
+    up = centers[0] - centers[-1]
+    if up.length_squared <= EPSILON:
+        up = _average_points([
+            Vector(chain[0]) - Vector(chain[-1])
+            for chain in control_points
+        ])
+    up = _safe_normalized(up, Vector((0.0, 0.0, 1.0)))
+    frame = (centers, up)
+    _VARIABLE_ASYM_FRAME_CACHE["source"] = control_points
+    _VARIABLE_ASYM_FRAME_CACHE["frame"] = frame
+    return frame
+
+
+def _variable_asym_ring_point(control_points, level, raw_u):
+    count = len(control_points)
+    value = (float(raw_u) % 1.0) * count
+    first = int(math.floor(value)) % count
+    second = (first + 1) % count
+    factor = smoothstep(value - math.floor(value))
+    centers, up = _variable_asym_control_frame(control_points)
+    center = centers[level]
+    first_delta = Vector(control_points[first][level]) - center
+    second_delta = Vector(control_points[second][level]) - center
+    first_height = first_delta.dot(up)
+    second_height = second_delta.dot(up)
+    first_radial = first_delta - up * first_height
+    second_radial = second_delta - up * second_height
+    first_radius = first_radial.length
+    second_radius = second_radial.length
+    if first_radius <= EPSILON or second_radius <= EPSILON:
+        return _variable_asym_ring_point_linear(control_points, level, raw_u)
+
+    first_direction = first_radial / first_radius
+    second_direction = second_radial / second_radius
+    angle = math.atan2(
+        up.dot(first_direction.cross(second_direction)),
+        clamp(first_direction.dot(second_direction), -1.0, 1.0),
+    )
+    if angle <= EPSILON:
+        angle += math.tau
+    angle *= factor
+    direction = _safe_normalized(
+        first_direction * math.cos(angle)
+        + up.cross(first_direction) * math.sin(angle),
+        first_direction,
+    )
+    radius = _lerp_float(first_radius, second_radius, factor)
+    height = _lerp_float(first_height, second_height, factor)
+    return center + direction * radius + up * height
 
 def _variable_asym_surface_point(control_points, raw_u, local_v):
     rail = [
@@ -4905,8 +5109,8 @@ def build_variable_asymmetric_data(
     settings,
     anchor_bone_counts,
 ):
-    if not 4 <= len(control_points) <= 10:
-        raise ValueError("不对称控制点链数必须在 4 到 10 之间")
+    if not 4 <= len(control_points) <= 12:
+        raise ValueError("不对称控制点链数必须在 4 到 12 之间")
     if int(settings.columns) < len(control_points):
         raise ValueError("骨骼链数不能少于控制点链数")
     profile = _fit_smooth_hem_profile(
@@ -5024,6 +5228,9 @@ def build_variable_asymmetric_data(
     )):
         bone_chain = _equal_chord_chain(dense_chain, bone_count)
         preview_chain = _equal_chord_chain(dense_chain, max_bones)
+        if settings.smooth_bone_chains:
+            bone_chain = _smooth_open_bone_chain(bone_chain)
+            preview_chain = _smooth_open_bone_chain(preview_chain)
         bone_chains.append(bone_chain)
         preview_chains.append(preview_chain)
         chain_lengths.append(sum(
@@ -5459,6 +5666,7 @@ def _build(context, settings, build_bones, build_weights):
             fit_mode=settings.fit_mode,
             ring_fit_strength=settings.ring_fit_strength,
             longitudinal_smoothing=settings.longitudinal_smoothing,
+            smooth_bone_chains=settings.smooth_bone_chains,
             return_normals=True,
         )
         # Standard proxy behavior and roll reference are unchanged.
@@ -5514,16 +5722,17 @@ def _build(context, settings, build_bones, build_weights):
                         settings.prefix,
                         primary_mesh.name,
                     )
-                    apply_variable_asymmetric_proxy_weights(
-                        proxy_obj,
-                        armature,
-                        asymmetric_data["preview_grid"],
-                        asymmetric_data["bone_counts"],
-                        asymmetric_data["chain_lengths"],
-                        settings.prefix,
-                        settings.parent_bone,
-                        settings,
-                    )
+                    if not settings.workflow_enabled or settings.bind_weights:
+                        apply_variable_asymmetric_proxy_weights(
+                            proxy_obj,
+                            armature,
+                            asymmetric_data["preview_grid"],
+                            asymmetric_data["bone_counts"],
+                            asymmetric_data["chain_lengths"],
+                            settings.prefix,
+                            settings.parent_bone,
+                            settings,
+                        )
                 else:
                     proxy_obj = create_proxy_mesh(
                         samples,
@@ -5742,7 +5951,7 @@ def _update_asym_control_chain_count(settings, context):
     if not _controls_are_asymmetric(controls) or not controls:
         return
     old_count = len(controls)
-    new_count = int(clamp(settings.asym_control_chain_count, 4, 10))
+    new_count = int(clamp(settings.asym_control_chain_count, 4, 12))
     if old_count == new_count:
         return
 
@@ -5801,7 +6010,7 @@ def _update_asym_control_chain_count(settings, context):
 class AUTOSKIRT_OT_generate_control_points(bpy.types.Operator):
     bl_idname = "auto_skirt.generate_control_points"
     bl_label = "生成控制点"
-    bl_description = "根据编辑模式选区生成标准四向控制点或 4–10 条不对称控制链"
+    bl_description = "根据编辑模式选区生成标准四向控制点或 4–12 条不对称控制链"
     bl_options = {'REGISTER', 'UNDO'}
 
     def execute(self, context):
@@ -6141,7 +6350,7 @@ class AUTOSKIRT_PG_settings(bpy.types.PropertyGroup):
         name="裙摆类型",
         items=(
             ('STANDARD', "标准裙摆", "使用原有稳定的闭合裙摆算法"),
-            ('ASYMMETRIC', "不对称裙摆", "4–10 条可编辑控制链，每条链可设置独立骨骼数"),
+            ('ASYMMETRIC', "不对称裙摆", "4–12 条可编辑控制链，每条链可设置独立骨骼数"),
         ),
         default='STANDARD',
     )
@@ -6154,7 +6363,7 @@ class AUTOSKIRT_PG_settings(bpy.types.PropertyGroup):
         name="控制点链数",
         default=6,
         min=4,
-        max=10,
+        max=12,
         description="不对称裙摆的环向控制链数量；修改后从当前控制笼重采样",
         update=_update_asym_control_chain_count,
     )
@@ -6188,10 +6397,10 @@ class AUTOSKIRT_PG_settings(bpy.types.PropertyGroup):
         max=256,
     )
     control_levels: IntProperty(
-        name="控制层数",
+        name="每链控制点数",
         default=4,
-        min=4,
-        max=4,
+        min=2,
+        max=32,
     )
     closed_loop: BoolProperty(
         name="闭合环",
@@ -6235,6 +6444,11 @@ class AUTOSKIRT_PG_settings(bpy.types.PropertyGroup):
         name="纵向轻度平滑",
         default=True,
         description="对中间层做 0.2/0.6/0.2 平滑，顶底层不变",
+    )
+    smooth_bone_chains: BoolProperty(
+        name="平滑骨骼链",
+        default=False,
+        description="生成前对每条骨骼链做 3 次纵向平滑，保留首尾关节，抑制面褶皱造成的起伏",
     )
     top_blend_to_parent: BoolProperty(
         name="顶部混合到父骨骼",
@@ -6407,6 +6621,7 @@ class AUTOSKIRT_PT_main(bpy.types.Panel):
             option_box.prop(settings, "use_lr_suffix_names")
             option_box.prop(settings, "rows")
             option_box.prop(settings, "columns")
+        option_box.prop(settings, "smooth_bone_chains")
         option_box.prop(settings, "create_proxy_mesh")
 
         if settings.control_edit_active:
@@ -6467,6 +6682,8 @@ classes = (
     AUTOSKIRT_PT_main,
 )
 
+
+unified_generator.configure(sys.modules[__name__], sheet_generator)
 
 def register():
     for cls in classes:
